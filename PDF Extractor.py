@@ -480,13 +480,13 @@ def stamp_pdf(
     email: str,
     placement: str,
 ) -> bytes:
+    """Place the stamp centered in a detected blank area without covering invoice content."""
     document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     try:
         page = document[page_index]
         page_rect = page.rect
         font_size = 9
         line_gap = 12
-
         stamp_lines = ["JUNIPER GL CODE                                      AMOUNT"]
         for row in rows:
             stamp_lines.append(f'{row["Juniper GL Code"]}    ${float(row["Amount"]):,.2f}')
@@ -496,27 +496,55 @@ def stamp_pdf(
         if email.strip():
             stamp_lines.append(email.strip())
 
-        anchor_y = None
+        longest = max((len(line) for line in stamp_lines), default=30)
+        width = min(max(330, longest * font_size * 0.53 + 20), page_rect.width - 56)
+        height = len(stamp_lines) * line_gap + 12
+        x = max(28, (page_rect.width - width) / 2)
+
+        occupied = []
         for block in page.get_text("blocks"):
-            block_text = block[4].upper()
-            if "TOTAL AMOUNT" in block_text or "INVOICE TOTAL" in block_text:
-                anchor_y = max(anchor_y or 0, block[3])
-        if anchor_y is None:
-            anchor_y = page_rect.height * 0.62
+            x0, y0, x1, y1 = block[:4]
+            if x1 > 0 and y1 > 0 and x0 < page_rect.width and y0 < page_rect.height:
+                occupied.append(pymupdf.Rect(x0, y0, x1, y1))
+        try:
+            for drawing in page.get_drawings():
+                drawing_rect = drawing.get("rect")
+                if drawing_rect and drawing_rect.width > 0 and drawing_rect.height > 0:
+                    occupied.append(pymupdf.Rect(drawing_rect))
+        except Exception:
+            pass
 
-        stamp_height = len(stamp_lines) * line_gap + 10
-        x = 42
-        y = page_rect.height - stamp_height - 24 if placement == "Bottom of summary page" else anchor_y + 10
-        if y + stamp_height > page_rect.height - 12 or y < 10:
-            raise ValueError("Insufficient safe space for stamp at selected location.")
+        center_y = (page_rect.height - height) / 2
+        candidates = [center_y]
+        step = max(12, line_gap)
+        max_offset = int(max(0, page_rect.height - height - 36))
+        for offset in range(step, max_offset + step, step):
+            candidates.extend([center_y - offset, center_y + offset])
 
-        width = min(420, page_rect.width - x - 20)
-        background = pymupdf.Rect(x - 4, y - 4, x + width, y + stamp_height)
-        page.draw_rect(background, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+        def is_clear(y):
+            candidate = pymupdf.Rect(x - 8, y - 6, x + width + 8, y + height + 6)
+            if candidate.x0 < 20 or candidate.x1 > page_rect.width - 20:
+                return False
+            if candidate.y0 < 18 or candidate.y1 > page_rect.height - 18:
+                return False
+            for item in occupied:
+                # Ignore thin page-border rules at the very edge.
+                if item.width > page_rect.width * 0.92 and (item.y0 < 6 or item.y1 > page_rect.height - 6):
+                    continue
+                if candidate.intersects(item):
+                    return False
+            return True
+
+        y = next((candidate for candidate in candidates if is_clear(candidate)), None)
+        if y is None:
+            raise ValueError("No clear space is available for the stamp on this page.")
+
+        panel = pymupdf.Rect(x - 8, y - 6, x + width + 8, y + height + 6)
+        page.draw_rect(panel, color=(0.82, 0.85, 0.87), fill=(1, 1, 1), width=0.7, overlay=True)
         for index, line in enumerate(stamp_lines):
             if line:
                 page.insert_text(
-                    (x, y + index * line_gap + font_size),
+                    (x + 4, y + index * line_gap + font_size),
                     line,
                     fontname="helv",
                     fontsize=font_size,
@@ -526,7 +554,6 @@ def stamp_pdf(
         return document.tobytes(garbage=4, deflate=True)
     finally:
         document.close()
-
 
 st.markdown("""
 <style>
@@ -547,7 +574,7 @@ with st.sidebar:
     selected_region = st.selectbox("Invoice region", list(REGION_RULES.keys()))
     stamp_placement = st.selectbox(
         "Stamp placement",
-        ["Below invoice total", "Bottom of summary page"],
+        ["Center in available blank space", "Bottom of summary page"],
     )
     st.caption("Region-specific validation rules are applied automatically.")
 
@@ -699,7 +726,7 @@ if uploaded_pdf is not None:
                 st.download_button(
                     "Download stamped PDF",
                     data=result_pdf,
-                    file_name=f"{base_name}_STAMPED.pdf",
+                    file_name=f"{base_name}_with_Approval.pdf",
                     mime="application/pdf",
                     use_container_width=True,
                 )
