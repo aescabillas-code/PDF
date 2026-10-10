@@ -355,7 +355,7 @@ def extract_region_amounts_from_page(page, region: str) -> tuple[list[dict], Opt
         candidates = []
         for lx0, ly0, lx1, ly1 in boxes:
             for ax0, ay0, ax1, ay1, value in amounts:
-                if region in ("NA and LATAM", "EMEA & APAC"):
+                if region in ("IPLS", "NA and LATAM", "EMEA & APAC"):
                     # Amount must be below its own USD column header.
                     # These invoice layouts can place the amount far to the right
                     # of the heading, so do not cap the horizontal distance.
