@@ -68,7 +68,7 @@ REGION_ALIASES = {
 REGION_RULES = {region: {} for region in REGION_LABELS}
 NET_LABEL = "Net amount / Subtotal"
 VAT_LABEL = "Tax amount / VAT / GST"
-MONEY_RE = re.compile(r"(?<![A-Z0-9])\\$?\\s*([\\d,]+\\.\\d{2})(?!\\d)")
+MONEY_RE = re.compile(r"(?<![A-Z0-9])\$?\s*([\d,]+\.\d{2})(?!\d)")
 EMAIL_RE = re.compile(r"[\\w.+-]+@[\\w.-]+\\.[A-Za-z]{2,}")
 APPROVAL_RE = re.compile(r"Approved\\s+by\\s+(.+?)\\s+(\\d{2}[./-]\\d{2}[./-]\\d{4})", re.I)
 
