@@ -671,7 +671,7 @@ def stamp_pdf(
         page = document[page_index]
         page_rect = page.rect
         region_key = normalize_region(region)
-        compact_regional_stamp = region_key in ("NA and LATAM", "EMEA & APAC")
+        compact_regional_stamp = region_key in ("IPLS", "NA and LATAM", "EMEA & APAC")
         # These two invoice layouts have a specific blank area below the service
         # description and to the left of NET TOTAL PAYABLE. Use a compact stamp
         # there; all other regions retain their existing placement and sizing.
@@ -728,15 +728,29 @@ def stamp_pdf(
         y_min = margin_y
         y_max = page_rect.height - stamp_height - margin_y
 
-        if compact_regional_stamp:
-            # Constrain the stamp to the requested blank section: below the
-            # service-description paragraph, left of NET TOTAL PAYABLE, and above
-            # the THIS INVOICE footer line. The exact bounds are read from page text.
+        if region_key == "IPLS":
+            # IPLS uses the same regional GL extraction rules as NA/LATAM and
+            # EMEA/APAC, but its stamp must be placed below "PLEASE PAY THIS AMOUNT".
+            please_pay_bottom = None
+            for rect, block_text in occupied:
+                upper = re.sub(r"\\s+", " ", block_text.upper())
+                if "PLEASE PAY THIS AMOUNT" in upper:
+                    please_pay_bottom = max(please_pay_bottom or rect.y1, rect.y1)
+            if please_pay_bottom is None:
+                raise ValueError("The IPLS placement anchor was not found on the selected page.")
+            x_min = max(18, page_rect.x0 + 18)
+            x_max = page_rect.x1 - stamp_width - 18
+            y_min = max(18, please_pay_bottom + 5)
+            y_max = page_rect.y1 - stamp_height - 18
+        elif compact_regional_stamp:
+            # Preserve the existing placement for NA/LATAM and EMEA/APAC:
+            # below the service-description paragraph, left of NET TOTAL PAYABLE,
+            # and above the THIS INVOICE footer line.
             service_bottom = None
             payable_left = None
             footer_top = None
             for rect, block_text in occupied:
-                upper = re.sub(r"\s+", " ", block_text.upper())
+                upper = re.sub(r"\\s+", " ", block_text.upper())
                 if "THE SERVICES SHOWN ON THIS INVOICE" in upper:
                     service_bottom = max(service_bottom or rect.y1, rect.y1)
                 if "NET TOTAL PAYABLE" in upper:
@@ -748,6 +762,7 @@ def stamp_pdf(
                 x_max = min(page_rect.x1 - stamp_width - 12, payable_left - stamp_width - 12)
                 y_min = max(18, service_bottom + 5)
                 y_max = min(page_rect.y1 - stamp_height - 12, footer_top - stamp_height - 5)
+
         if x_max < x_min or y_max < y_min:
             raise ValueError("Stamp does not fit on the selected page.")
 
