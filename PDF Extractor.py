@@ -133,9 +133,12 @@ def extract_region_amounts_from_page(page, region: str) -> tuple[list[dict], Opt
     elif region == "UK":
         specs = {"net": ["SUBTOTAL"], "vat": ["VAT"]}
     else:
+        # In NA/LATAM and EMEA/APAC invoices, the VAT column heading is split
+        # across two lines: "TOTAL REGION" above "VAT/TAXES(USD)". Match the
+        # second-line column heading directly so the tax amount is not missed.
         specs = {
             "net": ["NET AMOUNT(USD)", "NET AMOUNT (USD)"],
-            "vat": ["TOTAL REGION VAT/TAXES(USD)", "TOTAL REGION VAT/TAXES (USD)"],
+            "vat": ["VAT/TAXES(USD)", "VAT/TAXES (USD)"],
         }
 
     for kind, labels in specs.items():
@@ -158,7 +161,12 @@ def extract_region_amounts_from_page(page, region: str) -> tuple[list[dict], Opt
                         continue
                     if ax0 < lx0 - 35:
                         continue
-                    candidates.append((ay0 - ly1, abs(ax0 - lx0), value))
+                    # Prefer the amount whose horizontal center is closest to
+                    # this column header; this keeps the total-amount column from
+                    # being mistaken for the VAT/tax amount.
+                    header_center = (lx0 + lx1) / 2
+                    amount_center = (ax0 + ax1) / 2
+                    candidates.append((ay0 - ly1, abs(amount_center - header_center), value))
                 else:
                     # AU/UK values are printed on the same row, to the right of label.
                     vertical = abs((ay0 + ay1) / 2 - (ly0 + ly1) / 2)
