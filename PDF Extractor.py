@@ -1219,8 +1219,9 @@ div.st-key-nav_vendor_sow {
     z-index: 1001 !important;
     margin: 0 !important;
 }
-div.st-key-nav_pdf_stamp { bottom: 4.35rem !important; }
-div.st-key-nav_vendor_sow { bottom: 1rem !important; }
+/* Keep Vendor SOW Analyzer above the PDF Approval Stamp Tool. */
+div.st-key-nav_vendor_sow { bottom: 4.35rem !important; }
+div.st-key-nav_pdf_stamp { bottom: 1rem !important; }
 div.st-key-nav_pdf_stamp button,
 div.st-key-nav_vendor_sow button {
     width: 100% !important;
