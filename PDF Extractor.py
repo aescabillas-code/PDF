@@ -729,18 +729,26 @@ def stamp_pdf(
         y_max = page_rect.height - stamp_height - margin_y
 
         if region_key == "IPLS":
-            # IPLS stamp placement is anchored below "PLEASE PAY THIS AMOUNT"
-            # and aligned to the left side of the page as in the reference image.
-            please_pay_bottom = None
+            # IPLS stamp placement is anchored directly below "PLEASE PAY THIS AMOUNT".
+            # Keep the stamp beneath the heading rather than at the left page margin.
+            please_pay_rect = None
             for rect, block_text in occupied:
                 upper = re.sub(r"\s+", " ", block_text.upper())
                 if "PLEASE PAY THIS AMOUNT" in upper:
-                    please_pay_bottom = max(please_pay_bottom or rect.y1, rect.y1)
-            if please_pay_bottom is None:
+                    if please_pay_rect is None:
+                        please_pay_rect = rect
+                    else:
+                        please_pay_rect = pymupdf.Rect(
+                            min(please_pay_rect.x0, rect.x0),
+                            min(please_pay_rect.y0, rect.y0),
+                            max(please_pay_rect.x1, rect.x1),
+                            max(please_pay_rect.y1, rect.y1),
+                        )
+            if please_pay_rect is None:
                 raise ValueError("The IPLS placement anchor was not found on the selected page.")
-            x_min = max(18, page_rect.x0 + 18)
-            x_max = x_min
-            y_min = max(18, please_pay_bottom + 5)
+            x_min = max(18, please_pay_rect.x0)
+            x_max = min(page_rect.width - stamp_width - 18, x_min)
+            y_min = max(18, please_pay_rect.y1 + 5)
             y_max = page_rect.y1 - stamp_height - 18
         elif compact_regional_stamp:
             # Preserve the existing placement for NA/LATAM and EMEA/APAC:
