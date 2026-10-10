@@ -24,6 +24,7 @@ import pandas as pd
 import pytesseract
 from PIL import Image
 from io import BytesIO
+from openpyxl.styles import PatternFill, Border, Side, Alignment, Font
 
 st.set_page_config(page_title="PDF Approval Stamp Tool", page_icon="📄", layout="wide", initial_sidebar_state="expanded")
 
@@ -143,6 +144,24 @@ def _india_parse_invoice(pdf_bytes: bytes) -> dict:
     has_igst = bool(re.search(r"\bIGST\b", text, re.I))
     has_cgst = bool(re.search(r"\bCGST\b", text, re.I))
     has_sgst = bool(re.search(r"\b(?:SGST|UTGST)\b", text, re.I))
+
+    # When both slab-specific tax lines are present, use their actual amounts
+    # and add them together instead of deriving tax by splitting the total.
+    def slab_amount(code):
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if re.search(re.escape(code), line, re.I):
+                matches = re.findall(r"\d[\d,]*\.\d{2}", line)
+                if matches:
+                    return _india_amount(matches[-1])
+                chunk = " ".join(lines[i:i + 3])
+                matches = re.findall(r"\d[\d,]*\.\d{2}", chunk)
+                if matches:
+                    return _india_amount(matches[-1])
+        return None
+
+    slab_sgst = slab_amount("SGST-INV-SLAB4")
+    slab_cgst = slab_amount("CGST-INV-SLAB4")
     total = value_after([
         r"\bINVOICE TOTAL\b[\s\S]{0,80}?([₹]?\s*[\d,]+\.\d{2})",
         r"\bTOTAL AMOUNT\b[\s\S]{0,80}?([₹]?\s*[\d,]+\.\d{2})",
@@ -155,7 +174,12 @@ def _india_parse_invoice(pdf_bytes: bytes) -> dict:
     cgst = round(tax_total / 2, 2) if has_cgst and has_sgst and tax_total is not None else None
     sgst = cgst if has_cgst and has_sgst else None
     tax_field = igst if has_igst else cgst
-    tax_type = "IGST" if has_igst else ("CGST/SGST" if has_cgst and has_sgst else "")
+    if slab_sgst is not None and slab_cgst is not None:
+        tax_field = round(slab_sgst + slab_cgst, 2)
+        cgst, sgst = slab_cgst, slab_sgst
+        tax_type = "CGST/SGST"
+    else:
+        tax_type = "IGST" if has_igst else ("CGST/SGST" if has_cgst and has_sgst else "")
     return {
         "invoice_number": inv_match.group(1).upper() if inv_match else "",
         "gstin": gstin,
@@ -888,8 +912,20 @@ if selected_region == "INDIA":
         st.session_state.setdefault("india_duplicates", [])
         st.session_state.setdefault("india_results", [])
 
+    # Incrementing the uploader key recreates the widget and clears its selected PDFs.
+    # The callback runs before the next script execution, avoiding direct mutation
+    # of a file_uploader widget after it has been instantiated.
+    def _reset_india_pdf_uploads():
+        st.session_state["india_pdf_uploader_version"] = (
+            st.session_state.get("india_pdf_uploader_version", 0) + 1
+        )
+
+    _india_pdf_uploader_key = f"india_pdfs_{st.session_state.get('india_pdf_uploader_version', 0)}"
     india_pdfs = st.file_uploader(
-        "Upload matching invoice PDFs", type=["pdf"], accept_multiple_files=True, key="india_pdfs"
+        "Upload matching invoice PDFs",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key=_india_pdf_uploader_key,
     )
 
     if india_pdfs and st.button("Extract PDF data into template table", type="primary", use_container_width=True):
@@ -909,6 +945,24 @@ if selected_region == "INDIA":
         except Exception:
             st.error("The invoice PDFs could not be processed. Check that the PDFs are valid and try again.")
 
+    st.markdown("""
+    <style>
+    div[data-testid="stDataEditor"] [role="columnheader"] {
+        background-color: #FF2400 !important;
+        color: #FFFFFF !important;
+        text-align: center !important;
+        border: 1px solid #222222 !important;
+        justify-content: center !important;
+    }
+    div[data-testid="stDataEditor"] [role="gridcell"] {
+        text-align: center !important;
+        border: 1px solid #777777 !important;
+    }
+    div[data-testid="stDataEditor"] [role="row"] {
+        border-bottom: 1px solid #777777 !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
     st.subheader("Review and edit table")
     st.caption("The table is built into the app and is displayed immediately below the PDF upload. Upload PDFs and select Extract PDF data into template table to populate matching rows.")
     india_edited_frame = st.data_editor(
@@ -950,6 +1004,46 @@ if selected_region == "INDIA":
         mime="text/csv",
         use_container_width=True,
     )
+
+    st.button(
+        "Reset uploaded PDFs",
+        on_click=_reset_india_pdf_uploads,
+        use_container_width=True,
+        help="Clear the uploaded India invoice PDFs so you can select a new batch.",
+    )
+
+    # CSV is plain text and cannot store cell borders, alignment, or header colors.
+    # Offer an additionally formatted XLSX while keeping the requested CSV download.
+    _india_xlsx_buffer = BytesIO()
+    with pd.ExcelWriter(_india_xlsx_buffer, engine="openpyxl") as _writer:
+        india_edited_frame.to_excel(_writer, index=False, sheet_name="NCR")
+        _ws = _writer.sheets["NCR"]
+        _scarlet = PatternFill(fill_type="solid", fgColor="FF2400")
+        _white_bold = Font(color="FFFFFF", bold=True)
+        _thin_border = Border(
+            left=Side(style="thin", color="777777"),
+            right=Side(style="thin", color="777777"),
+            top=Side(style="thin", color="777777"),
+            bottom=Side(style="thin", color="777777"),
+        )
+        for _row in _ws.iter_rows():
+            for _cell in _row:
+                _cell.alignment = Alignment(horizontal="center", vertical="center")
+                _cell.border = _thin_border
+                if _cell.row == 1:
+                    _cell.fill = _scarlet
+                    _cell.font = _white_bold
+        _ws.freeze_panes = "A2"
+        _ws.auto_filter.ref = _ws.dimensions
+
+    st.download_button(
+        "Download formatted Excel table",
+        data=_india_xlsx_buffer.getvalue(),
+        file_name=st.session_state.get("india_csv_name", f"NCR Invoice AP Upload file {datetime.now().strftime('%m.%d.%Y')}.csv").rsplit(".", 1)[0] + ".xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+    st.caption("Note: CSV files cannot preserve borders, alignment, or header colors. Use the formatted Excel download to retain the scarlet header, borders, and centered cells.")
     st.stop()
 
 
