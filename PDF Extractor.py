@@ -1065,18 +1065,19 @@ def _sow_render_tool():
 # ---------------- End Vendor SOW Scope Comparator ----------------
 
 
-st.markdown("""
-<style>
-.block-container {padding-top: 1.5rem; max-width: 1400px;}
-.hero {padding: 1.2rem 1.4rem; border-radius: 14px; background: linear-gradient(120deg,#006B4F,#008A69); color: white; margin-bottom: 1rem;}
-.hero h1 {color:white; margin:0;}
-.hero p {color:#e7fff6; margin:.35rem 0 0 0;}
-</style>
-<div class="hero">
-<h1>PDF Approval Stamp Tool</h1>
-<p>Extract Juniper GL details, validate approval totals, and stamp a separate copy of an invoice.</p>
-</div>
-""", unsafe_allow_html=True)
+if st.session_state.get("active_tool", "pdf") != "sow":
+    st.markdown("""
+    <style>
+    .block-container {padding-top: 1.5rem; max-width: 1400px;}
+    .hero {padding: 1.2rem 1.4rem; border-radius: 14px; background: linear-gradient(120deg,#006B4F,#008A69); color: white; margin-bottom: 1rem;}
+    .hero h1 {color:white; margin:0;}
+    .hero p {color:#e7fff6; margin:.35rem 0 0 0;}
+    </style>
+    <div class="hero">
+    <h1>PDF Approval Stamp Tool</h1>
+    <p>Extract Juniper GL details, validate approval totals, and stamp a separate copy of an invoice.</p>
+    </div>
+    """, unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("Processing rules")
@@ -1102,7 +1103,7 @@ with st.sidebar:
         st.rerun()
 
 if st.session_state.get("active_tool") == "sow":
-    if st.sidebar.button("← Back to PDF Approval Stamp Tool", key="back_to_pdf_tool", use_container_width=True):
+    if st.button("← PDF Approval Stamp Tool", key="back_to_pdf_tool", use_container_width=True):
         st.session_state["active_tool"] = "pdf"
         st.rerun()
     _sow_render_tool()
