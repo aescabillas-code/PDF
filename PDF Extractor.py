@@ -1,5 +1,5 @@
 """
-Juniper PDF Approval Stamp Tool — privacy-hardened Streamlit app.
+PDF Approval Stamp Tool — privacy-hardened Streamlit app.
 
 Privacy controls:
 - No invoice values or extracted personal/business data are written to logs.
@@ -22,6 +22,9 @@ from typing import Optional
 import streamlit as st
 import pymupdf
 import pandas as pd
+import pytesseract
+from PIL import Image
+from io import BytesIO
 
 st.set_page_config(page_title="PDF Approval Stamp Tool", page_icon="📄", layout="wide", initial_sidebar_state="expanded")
 
@@ -145,18 +148,48 @@ def extract_from_page(text: str, region_hint: Optional[str] = None) -> dict:
     }
 
 
-def find_candidate_pages(pdf_bytes: bytes) -> list[tuple[int, str]]:
+def _looks_like_summary(page_text: str) -> bool:
+    upper_text = page_text.upper()
+    return "JUNIPER GL CODE" in upper_text and (
+        "TOTAL AMOUNT" in upper_text or "APPROVED BY" in upper_text
+    )
+
+
+def _ocr_page(page) -> str:
+    # Render in memory only; no invoice images or OCR text are written to disk.
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
+    image = Image.open(BytesIO(pix.tobytes("png")))
+    return pytesseract.image_to_string(image, config="--psm 6")
+
+
+def find_candidate_pages(pdf_bytes: bytes) -> tuple[list[tuple[int, str]], bool]:
+    """Find summary pages using embedded text first, then OCR as a fallback.
+
+    Returns (candidate_pages, used_ocr). OCR runs across pages only when the
+    normal text pass finds no summary, keeping text-based PDFs fast.
+    """
     document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     try:
+        text_pages = []
         candidates = []
         for page_number, page in enumerate(document):
             page_text = page.get_text("text")
-            upper_text = page_text.upper()
-            if "JUNIPER GL CODE" in upper_text and (
-                "TOTAL AMOUNT" in upper_text or "APPROVED BY" in upper_text
-            ):
+            text_pages.append((page_number, page_text))
+            if _looks_like_summary(page_text):
                 candidates.append((page_number, page_text))
-        return candidates
+        if candidates:
+            return candidates, False
+
+        ocr_candidates = []
+        for page_number, page in enumerate(document):
+            try:
+                page_text = _ocr_page(page)
+            except Exception:
+                # Continue to other pages; user-facing errors remain generic.
+                continue
+            if _looks_like_summary(page_text):
+                ocr_candidates.append((page_number, page_text))
+        return ocr_candidates, True
     finally:
         document.close()
 
@@ -281,14 +314,17 @@ uploaded_pdf = st.file_uploader("Upload invoice PDF", type=["pdf"])
 if uploaded_pdf is not None:
     pdf_content = uploaded_pdf.getvalue()  # in-memory; no local temp copy
     try:
-        with st.spinner("Reading PDF text..."):
-            candidate_pages = find_candidate_pages(pdf_content)
+        with st.spinner("Searching PDF text and using OCR if needed..."):
+            candidate_pages, used_ocr = find_candidate_pages(pdf_content)
     except Exception:
         st.error("The PDF could not be opened. Check that it is a valid, readable PDF.")
         st.stop()
 
+    if used_ocr:
+        st.info("The PDF did not contain a detectable text summary. OCR was used to search scanned pages; please verify every extracted value before stamping.")
     if not candidate_pages:
-        st.error("No selectable-text Juniper GL summary was found. Scanned PDFs require OCR.")
+        st.error("No GL summary was detected, even after OCR. Confirm that the PDF contains a readable summary page, or use a clearer scan.")
+        st.caption("OCR requires the Tesseract OCR engine to be installed on the computer running this app.")
         st.stop()
 
     page_labels = [f"Page {page_number + 1}" for page_number, _ in candidate_pages]
