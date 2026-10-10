@@ -843,7 +843,7 @@ with st.sidebar:
 
 if selected_region == "INDIA":
     st.subheader("India — NCR AP Upload CSV")
-    st.caption("The NCR AP Excel template is provided with the app. Upload the matching invoice PDFs; matching requires both invoice number and supplier GSTIN.")
+    st.caption("The NCR AP Excel template is provided with the app. Upload matching invoice PDFs; matching requires both invoice number and supplier GSTIN.")
 
     qcol, ycol = st.columns(2)
     with qcol:
@@ -856,29 +856,48 @@ if selected_region == "INDIA":
     with mcol:
         selected_upload_month = st.selectbox("Weekly file month", ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"], index=datetime.now().month - 1)
 
-    st.caption("Upload matching invoice PDFs. The app will populate the table using the supplied NCR AP Excel template, preserve its original columns and rows, and let you review the table before downloading a CSV.")
+    # Load the supplied workbook on first render so the template table is always visible.
+    template_path = Path(__file__).resolve().with_name("NCR_Invoice_AP_Upload_Template.xlsx")
+    if not template_path.exists():
+        # Also support the original uploaded workbook filename when the app is run locally.
+        template_path = Path(__file__).resolve().with_name("NCR Invoice AP Upload file.xlsx")
+
+    if st.session_state.get("india_template_frame") is None:
+        try:
+            if not template_path.exists():
+                raise FileNotFoundError
+            _initial_template = pd.read_excel(template_path, sheet_name="NCR", dtype=object)
+            _initial_template.columns = [_india_clean_text(c) for c in _initial_template.columns]
+            st.session_state["india_template_frame"] = _initial_template
+            st.session_state["india_csv_name"] = f"NCR Invoice AP Upload file {datetime.now().strftime('%m.%d.%Y')}.csv"
+            st.session_state.setdefault("india_unmatched", [])
+            st.session_state.setdefault("india_duplicates", [])
+            st.session_state.setdefault("india_results", [])
+        except Exception:
+            st.error("The supplied NCR AP Excel template could not be loaded. Ensure the template workbook is included beside the app.")
+
+    st.caption("The table below is loaded from the supplied NCR AP Excel template and is displayed immediately. Upload PDFs and select Extract PDF data into template table to populate matching rows.")
     india_pdfs = st.file_uploader("Upload matching invoice PDFs", type=["pdf"], accept_multiple_files=True, key="india_pdfs")
 
-    if india_pdfs:
-        if st.button("Extract PDF data into template table", type="primary", use_container_width=True):
-            try:
-                template_path = Path(__file__).resolve().with_name("NCR_Invoice_AP_Upload_Template.xlsx")
-                if not template_path.exists():
-                    raise FileNotFoundError
-                template_bytes = template_path.read_bytes()
-                with st.spinner("Matching invoice numbers and supplier GSTINs..."):
-                    india_frame, india_results, india_unmatched, india_duplicates = _india_make_csv(
-                        template_bytes, india_pdfs, selected_quarter, int(selected_year),
-                        selected_fee_type, selected_upload_month, int(selected_year)
-                    )
-                st.session_state["india_template_frame"] = india_frame
-                st.session_state["india_results"] = india_results
-                st.session_state["india_unmatched"] = india_unmatched
-                st.session_state["india_duplicates"] = india_duplicates
-                st.session_state["india_csv_name"] = f"NCR Invoice AP Upload file {datetime.now().strftime('%m.%d.%Y')}.csv"
-                st.success(f"Extracted data into the template table. {len(india_results)} invoice record(s) matched.")
-            except Exception:
-                st.error("The supplied Excel template or invoice PDFs could not be processed. Check the template file and uploaded PDFs.")
+    if india_pdfs and st.button("Extract PDF data into template table", type="primary", use_container_width=True):
+        try:
+            if not template_path.exists():
+                raise FileNotFoundError
+            template_bytes = template_path.read_bytes()
+            with st.spinner("Matching invoice numbers and supplier GSTINs..."):
+                india_frame, india_results, india_unmatched, india_duplicates = _india_make_csv(
+                    template_bytes, india_pdfs, selected_quarter, int(selected_year),
+                    selected_fee_type, selected_upload_month, int(selected_year)
+                )
+            st.session_state["india_template_frame"] = india_frame
+            st.session_state["india_results"] = india_results
+            st.session_state["india_unmatched"] = india_unmatched
+            st.session_state["india_duplicates"] = india_duplicates
+            st.session_state["india_csv_name"] = f"NCR Invoice AP Upload file {datetime.now().strftime('%m.%d.%Y')}.csv"
+            st.session_state.pop("india_template_data_editor", None)
+            st.success(f"Extracted data into the template table. {len(india_results)} invoice record(s) matched.")
+        except Exception:
+            st.error("The supplied Excel template or invoice PDFs could not be processed. Check that the template workbook is included and the PDFs are valid.")
 
     if st.session_state.get("india_template_frame") is not None:
         st.subheader("Review and edit template data")
@@ -922,9 +941,8 @@ if selected_region == "INDIA":
             mime="text/csv",
             use_container_width=True,
         )
-    else:
-        st.info("Upload the corresponding invoice PDFs to populate the template table.")
     st.stop()
+
 
 uploaded_pdf = st.file_uploader("Upload invoice PDF", type=["pdf"])
 
