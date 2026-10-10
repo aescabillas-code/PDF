@@ -924,10 +924,15 @@ def _sow_read_document(name, data):
     raise ValueError('Unsupported document format')
 
 
-def _sow_expand_uploads(uploads):
-    """Expand supported documents and nested ZIPs in memory, deduplicating exact copies."""
+def _sow_expand_uploads(uploads, return_errors=False):
+    """Expand supported documents and nested ZIPs in memory, deduplicating exact copies.
+
+    A single unreadable/password-protected document no longer aborts the entire batch.
+    Archive size/document-count safety limits remain hard errors.
+    """
     expanded = []
     seen_hashes = set()
+    processing_errors = []
     total_bytes = 0
 
     def add_document(name, data, depth=0):
@@ -937,9 +942,13 @@ def _sow_expand_uploads(uploads):
         suffix = ('.' + name.rsplit('.', 1)[-1].lower()) if '.' in name else ''
         if suffix == '.zip':
             if depth >= SOW_MAX_ARCHIVE_DEPTH:
+                processing_errors.append({'File': name, 'Reason': 'Nested ZIP depth limit reached; this archive was skipped.'})
                 return
             try:
                 with zipfile.ZipFile(BytesIO(data)) as archive:
+                    if archive.testzip() is not None:
+                        processing_errors.append({'File': name, 'Reason': 'Archive integrity check failed; this archive was skipped.'})
+                        return
                     for item in archive.infolist():
                         if item.is_dir():
                             continue
@@ -947,15 +956,25 @@ def _sow_expand_uploads(uploads):
                         inner_suffix = ('.' + inner_name.rsplit('.', 1)[-1].lower()) if '.' in inner_name else ''
                         if inner_suffix not in SOW_SUPPORTED_EXTS:
                             continue
+                        if item.flag_bits & 0x1:
+                            processing_errors.append({'File': f'{name} / {inner_name}', 'Reason': 'Password-protected archive entry; skipped.'})
+                            continue
                         if item.file_size > SOW_MAX_TOTAL_BYTES or total_bytes + item.file_size > SOW_MAX_TOTAL_BYTES:
                             raise ValueError('The expanded upload exceeds the 100 MB processing limit.')
-                        with archive.open(item) as handle:
-                            inner_data = handle.read(SOW_MAX_TOTAL_BYTES + 1)
-                        if len(inner_data) > SOW_MAX_TOTAL_BYTES:
-                            raise ValueError('A document in the archive exceeds the processing limit.')
-                        add_document(f'{name} / {inner_name}', inner_data, depth + 1)
-            except zipfile.BadZipFile:
-                return
+                        try:
+                            with archive.open(item) as handle:
+                                inner_data = handle.read(SOW_MAX_TOTAL_BYTES + 1)
+                            if len(inner_data) > SOW_MAX_TOTAL_BYTES:
+                                raise ValueError('A document in the archive exceeds the processing limit.')
+                            add_document(f'{name} / {inner_name}', inner_data, depth + 1)
+                        except ValueError:
+                            raise
+                        except Exception as exc:
+                            processing_errors.append({'File': f'{name} / {inner_name}', 'Reason': f'Could not read archive entry ({type(exc).__name__}); skipped.'})
+            except ValueError:
+                raise
+            except Exception as exc:
+                processing_errors.append({'File': name, 'Reason': f'Could not open ZIP archive ({type(exc).__name__}); check whether it is damaged or password-protected.'})
             return
         if suffix not in SOW_SUPPORTED_EXTS:
             return
@@ -966,12 +985,25 @@ def _sow_expand_uploads(uploads):
         total_bytes += len(data)
         if total_bytes > SOW_MAX_TOTAL_BYTES:
             raise ValueError('The expanded upload exceeds the 100 MB processing limit.')
-        text_value = _sow_read_document(name, data)
+        try:
+            text_value = _sow_read_document(name, data)
+        except Exception as exc:
+            processing_errors.append({'File': name, 'Reason': f'Could not read this document ({type(exc).__name__}); check file integrity, password protection, and required document-reader dependencies.'})
+            return
         if text_value and text_value.strip():
             expanded.append({'File': name, 'Text': text_value, 'SHA256': digest})
+        else:
+            processing_errors.append({'File': name, 'Reason': 'No readable text was extracted. Scanned/image-only or blank documents may need OCR or manual review.'})
 
     for uploaded in uploads or []:
-        add_document(uploaded.name, uploaded.getvalue())
+        try:
+            add_document(uploaded.name, uploaded.getvalue())
+        except ValueError:
+            raise
+        except Exception as exc:
+            processing_errors.append({'File': getattr(uploaded, 'name', 'Uploaded file'), 'Reason': f'Could not process upload ({type(exc).__name__}).'})
+    if return_errors:
+        return expanded, processing_errors
     return expanded
 
 
@@ -1275,7 +1307,7 @@ if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
 
     if st.button('Analyze vendor scope', type='primary', use_container_width=True, key='run_sow_analysis'):
         try:
-            parsed_docs = _sow_expand_uploads(vendor_files or [])
+            parsed_docs, document_errors = _sow_expand_uploads(vendor_files or [], return_errors=True)
             parsed_vendors_by_key = {}
             excluded_documents = []
             for document in parsed_docs:
@@ -1316,11 +1348,18 @@ if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
                     'Coverage area': _sow_detect_coverage_area(grouped['Files'], '\n'.join(grouped['Texts'])),
                 })
 
-            baseline_docs = _sow_expand_uploads([baseline_file]) if baseline_file is not None else []
+            if baseline_file is not None:
+                baseline_docs, baseline_errors = _sow_expand_uploads([baseline_file], return_errors=True)
+                document_errors.extend(baseline_errors)
+            else:
+                baseline_docs = []
             baseline_text = '\n\n'.join(item['Text'] for item in baseline_docs)
             baseline_scopes = _sow_extract_scope(baseline_text) if baseline_text.strip() else []
+            if document_errors:
+                with st.expander(f'Documents skipped or needing review ({len(document_errors)})', expanded=True):
+                    st.dataframe(pd.DataFrame(document_errors), use_container_width=True, hide_index=True)
             if len(parsed_vendors) < 2:
-                st.error('Upload at least two distinct vendor SOWs/capability documents. Exact duplicates are removed and documents with the same detected supplier are grouped together.')
+                st.error('Fewer than two distinct readable vendor groups were found. Review the skipped-document list above, confirm the ZIP is not password-protected, and ensure required document-reader packages are installed.')
             else:
                 if baseline_scopes:
                     baseline_records = [{'vendor': 'Global baseline', 'scope': scope} for scope in baseline_scopes]
@@ -1481,8 +1520,11 @@ if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
                         }).to_excel(writer, index=False, sheet_name='Recommendations')
                     st.download_button('Download SOW comparison workbook', data=export_buffer.getvalue(), file_name='Vendor_SOW_Analysis.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', use_container_width=True)
                     st.warning('Before selecting vendors, validate the source clauses for geography/countries, response and resolution SLAs, hours of coverage, onsite/remote requirements, exclusions, dependencies, certifications, subcontracting, and commercial assumptions. The analyzer does not certify legal equivalence.')
-        except Exception:
-            st.error('The SOW documents could not be analyzed. Check that the files are readable, not password-protected, and within the 100 MB expanded processing limit.')
+        except Exception as exc:
+            # Show technical type and a sanitized short reason, never extracted SOW content.
+            detail = re.sub(r'[\r\n\t]+', ' ', str(exc)).strip()[:240]
+            st.error('The SOW documents could not be analyzed. Check file readability, password protection, required dependencies, and the 100 MB expanded processing limit.')
+            st.caption(f'Technical diagnostic: {type(exc).__name__}' + (f' — {detail}' if detail else ''))
     st.stop()
 
 st.markdown("""
