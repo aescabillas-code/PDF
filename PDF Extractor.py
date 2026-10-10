@@ -1,5 +1,5 @@
 """
-PDF Approval Stamp Tool — privacy-hardened Streamlit app.
+Juniper PDF Approval Stamp Tool — privacy-hardened Streamlit app.
 
 Privacy controls:
 - No invoice values or extracted personal/business data are written to logs.
@@ -41,7 +41,7 @@ header[data-testid="stHeader"] {visibility: hidden !important; height: 0 !import
 
 # Encoded configuration keeps organization-specific labels and GL suffix mappings
 # out of plain sight in this source file. This is obfuscation, not encryption.
-_RULES_B64 = "eyJyb2xlcyI6eyJJUExTIjp7InZhdF9zdWZmaXgiOiIyMSIsIm5ldF9zdWZmaXgiOiIxOSJ9LCJBVSI6eyJ2YXRfc3VmZml4IjoiMjMiLCJuZXRfc3VmZml4IjoiMTkifSwiTkEgYW5kIExBVEFNIjp7InZhdF9zdWZmaXgiOiIyMSIsIm5ldF9zdWZmaXgiOiIxOSJ9LCJVSyI6eyJ2YXRfc3VmZml4IjoiMjEiLCJuZXRfc3VmZml4IjoiMTkifSwiRU1FQSAmIEFQQUMiOnsidmF0X3N1ZmZpeCI6IjIxIiwibmV0X3N1ZmZpeCI6IjE5In19LCJhbGlhc2VzIjp7Ik5BL0xBVEFNIjoiTkEgYW5kIExBVEFNIiwiTkEgJiBMQVRBTSI6Ik5BIGFuZCBMQVRBTSIsIkVNRUEgQVBBQyI6IkVNRUEgJiBBUEFDIiwiRU1FQS9BUEFDIjoiRU1FQSAmIEFQQUMifSwibmV0X2xhYmVsIjoiTkNSIENFIG9uLXNpdGUgY29zdCAvIFN1YnRvdGFsIiwidmF0X2xhYmVsIjoiVkFUIC8gR1NUIn0="
+_RULES_B64 = "eyJyb2xlcyI6eyJJUExTIjp7InZhdF9zdWZmaXgiOiIyMSIsIm5ldF9zdWZmaXgiOiIxOSJ9LCJBVSI6eyJ2YXRfc3VmZml4IjoiMjMiLCJuZXRfc3VmZml4IjoiMTkifSwiTkEgYW5kIExBVEFNIjp7InZhdF9zdWZmaXgiOiIyMSIsIm5ldF9zdWZmaXgiOiIxOSJ9LCJVSyI6eyJ2YXRfc3VmZml4IjoiMjEiLCJuZXRfc3VmZml4IjoiMTkifSwiRU1FQSAmIEFQQUMiOnsidmF0X3N1ZmZpeCI6IjIxIiwibmV0X3N1ZmZpeCI6IjE5In19LCJhbGlhc2VzIjp7Ik5BL0xBVEFNIjoiTkEgYW5kIExBVEFNIiwiTkEgJiBMQVRBTSI6Ik5BIGFuZCBMQVRBTSIsIkVNRUEgQVBBQyI6IkVNRUEgJiBBUEFDIiwiRU1FQS9BUEFDIjoiRU1FQSAmIEFQQUMifSwibmV0X2xhYmVsIjoiTkNSIENFIG9uLXNpdGUgY29zdCAvIFN1YnRvdGFsIiwidmF0X2xhYmVsIjoiVkFUIC8gR1NUIiwiZ2xfY29kZXMiOnsibmV0IjoiMzIzMDYyNDAxMDUwMTE2NzAxOSIsInZhdCI6IjMyMzA2MjQwMTA1MDExNjcwMjEiLCJhdV9nc3QiOiIzMjMwNjI0MDEwNTAxMTY2MDIzIn0sImxhYmVsX3Rlcm1zIjp7Im5ldCI6WyJORVQgQU1PVU5UIiwiTkVUIEFNT1VOVCAoVVNEKSJdLCJ2YXQiOlsiVE9UQUwgUkVHSU9OIFZBVC9UQVhFUyIsIlRPVEFMIFJFR0lPTiBWQVQvVEFYRVMgKFVTRCkiLCJUT1RBTCBHLlMuVCIsIlRPVEFMIEdTVCJdLCJ0b3RhbCI6WyJUT1RBTCBBTU9VTlQiLCJJTlZPSUNFIFRPVEFMIl19fQ=="
 try:
     _CONFIG = json.loads(base64.b64decode(_RULES_B64).decode("utf-8"))
 except Exception:
@@ -65,6 +65,111 @@ def normalize_region(value: str) -> str:
 def money_after(text: str, start: int = 0) -> Optional[float]:
     match = MONEY_RE.search(text, start)
     return float(match.group(1).replace(",", "")) if match else None
+
+
+def _amount_near_label(text: str, labels: list[str]) -> Optional[float]:
+    """Extract a labeled amount from common invoice layouts, including column tables.
+
+    Handles labels and amounts on the same line, labels on a header row with a
+    separate values row, and OCR/PDF extraction that separates currency symbols.
+    """
+    raw_lines = [line.rstrip() for line in (text or "").splitlines() if line.strip()]
+    norm_lines = [re.sub(r"\s+", " ", line).strip() for line in raw_lines]
+    upper_lines = [line.upper() for line in norm_lines]
+    norm_labels = [re.sub(r"\s+", " ", label.upper()).strip() for label in labels]
+
+    # First, parse line-level label/value pairs without crossing another known label.
+    all_labels = [
+        "NET AMOUNT (USD)", "NET AMOUNT(USD)", "NET AMOUNT",
+        "TOTAL REGION VAT/TAXES (USD)", "TOTAL REGION VAT/TAXES(USD)",
+        "TOTAL REGION VAT/TAXES", "TOTAL G.S.T", "TOTAL GST",
+        "TOTAL AMOUNT (USD)", "TOTAL AMOUNT(USD)", "TOTAL AMOUNT",
+        "INVOICE TOTAL", "SUBTOTAL", "AMOUNT DUE"
+    ]
+    for i, upper in enumerate(upper_lines):
+        if not any(label in upper for label in norm_labels):
+            continue
+        # If line contains several labels (table header row), don't bind a later
+        # column's value to the first label. Prefer same-line amounts only when
+        # this line itself contains a single summary label.
+        present = [lab for lab in all_labels if lab in upper]
+        same = list(MONEY_RE.finditer(norm_lines[i]))
+        if same and len(present) <= 1:
+            return float(same[-1].group(1).replace(",", ""))
+
+        # Search following rows first for the values row; stop at the next summary
+        # header. Use the first currency amount for a single-label column.
+        for j in range(i + 1, min(len(norm_lines), i + 5)):
+            candidate_upper = upper_lines[j]
+            if any(lab in candidate_upper for lab in all_labels):
+                break
+            matches = list(MONEY_RE.finditer(norm_lines[j]))
+            if matches:
+                # For a table values row with multiple amounts, select by the
+                # ordinal position of the label among summary columns.
+                # Build ordered, non-overlapping summary columns (longest match wins
+                # when e.g. NET AMOUNT is contained in NET AMOUNT (USD)).
+                label_positions = []
+                for lab in sorted(set(all_labels), key=len, reverse=True):
+                    pos = upper.find(lab)
+                    if pos >= 0 and not any(not (pos + len(lab) <= old_pos or pos >= old_pos + len(old_lab)) for old_pos, old_lab in label_positions):
+                        label_positions.append((pos, lab))
+                label_positions.sort()
+                requested = next((lab for lab in sorted(norm_labels, key=len, reverse=True) if lab in upper), None)
+                if len(matches) > 1 and requested:
+                    matching_pos = upper.find(requested)
+                    # Use the leftmost matching summary label's column position.
+                    ordinal = sum(1 for pos, _ in label_positions if pos < matching_pos)
+                    if ordinal < len(matches):
+                        return float(matches[ordinal].group(1).replace(",", ""))
+                return float(matches[0].group(1).replace(",", ""))
+
+        # A few PDF extractors emit the amount before the label.
+        for j in range(i - 1, max(-1, i - 4), -1):
+            if any(lab in upper_lines[j] for lab in all_labels):
+                break
+            matches = list(MONEY_RE.finditer(norm_lines[j]))
+            if matches:
+                return float(matches[-1].group(1).replace(",", ""))
+
+    # Flattened text: map each summary label to the nearest amount before the next label.
+    compact = re.sub(r"\s+", " ", text or "")
+    label_pattern = r"NET\s*AMOUNT\s*\(?\s*USD\s*\)?|TOTAL\s+REGION\s+VAT\s*/\s*TAXES\s*\(?\s*USD\s*\)?|TOTAL\s+G\.?S\.?T\.?|TOTAL\s+GST|TOTAL\s+AMOUNT\s*\(?\s*USD\s*\)?|INVOICE\s+TOTAL|SUBTOTAL|AMOUNT\s+DUE"
+    for label in labels:
+        match = re.search(re.escape(label), compact, re.I)
+        if match:
+            tail = compact[match.end():]
+            next_label = re.search(label_pattern, tail, re.I)
+            segment = tail[:next_label.start()] if next_label else tail[:120]
+            amount = money_after(segment)
+            if amount is not None:
+                return amount
+    return None
+
+
+def extract_labeled_gl_rows(text: str, region: str) -> tuple[list[dict], Optional[float]]:
+    """Map invoice summary labels to the configured GL codes; codes need not appear in the source invoice."""
+    labels = _CONFIG.get("label_terms", {})
+    codes = _CONFIG.get("gl_codes", {})
+    net_amount = _amount_near_label(text, labels.get("net", ["NET AMOUNT"]))
+    vat_labels = labels.get("vat", ["TOTAL G.S.T", "TOTAL GST"])
+    vat_amount = _amount_near_label(text, vat_labels)
+    total_amount = _amount_near_label(text, labels.get("total", ["TOTAL AMOUNT", "INVOICE TOTAL"]))
+
+    # When a document has both local-currency and USD summary rows, prefer the explicit USD label/value.
+    lines = [re.sub(r"\s+", " ", line).strip() for line in (text or "").splitlines() if line.strip()]
+    for i, line in enumerate(lines):
+        if "NET AMOUNT (USD)" in line.upper() or "NET AMOUNT(USD)" in line.upper():
+            net_amount = money_after(line) or (_amount_near_label("\n".join(lines[max(0, i-1):i+2]), ["NET AMOUNT (USD)", "NET AMOUNT(USD)"])) or net_amount
+            break
+
+    rows = []
+    if net_amount is not None:
+        rows.append({"Juniper GL Code": codes.get("net", ""), "Amount": net_amount})
+    if vat_amount is not None:
+        vat_code = codes.get("au_gst", "") if region == "AU" else codes.get("vat", "")
+        rows.append({"Juniper GL Code": vat_code, "Amount": vat_amount})
+    return rows, total_amount
 
 
 def extract_from_page(text: str, region_hint: Optional[str] = None) -> dict:
@@ -133,8 +238,14 @@ def extract_from_page(text: str, region_hint: Optional[str] = None) -> dict:
                 if total is not None:
                     break
 
+    # GL codes are not expected to be printed on the invoice. Derive rows from summary labels.
+    if not rows:
+        label_rows, label_total = extract_labeled_gl_rows(text, region)
+        rows = label_rows
+        if total is None:
+            total = label_total
+
     if not region:
-        # Conservative inference only; the user can explicitly select the region.
         region = "AU" if any(row["Juniper GL Code"].endswith("23") for row in rows) else ""
 
     return {
@@ -149,10 +260,23 @@ def extract_from_page(text: str, region_hint: Optional[str] = None) -> dict:
 
 
 def _looks_like_summary(page_text: str) -> bool:
-    upper_text = page_text.upper()
-    return "JUNIPER GL CODE" in upper_text and (
-        "TOTAL AMOUNT" in upper_text or "APPROVED BY" in upper_text
-    )
+    upper_text = re.sub(r"\s+", " ", (page_text or "").upper())
+    has_gl_block = "JUNIPER GL CODE" in upper_text and ("TOTAL AMOUNT" in upper_text or "APPROVED BY" in upper_text)
+    labels = _CONFIG.get("label_terms", {})
+    has_net = any(term.upper() in upper_text for term in labels.get("net", ["NET AMOUNT"]))
+    has_tax = any(term.upper() in upper_text for term in labels.get("vat", ["TOTAL G.S.T", "TOTAL GST"]))
+    has_total = any(term.upper() in upper_text for term in labels.get("total", ["TOTAL AMOUNT", "INVOICE TOTAL"]))
+    return has_gl_block or (has_net and has_tax and has_total)
+
+
+def _looks_like_financial_summary(page_text: str) -> bool:
+    """Recognize invoice totals pages even when no GL approval block exists."""
+    upper_text = re.sub(r"\s+", " ", (page_text or "").upper())
+    has_totals = any(label in upper_text for label in (
+        "SUBTOTAL", "TOTAL G.S.T", "TOTAL GST", "TOTAL REGION VAT/TAXES", "TOTAL AMOUNT", "INVOICE TOTAL", "AMOUNT DUE"
+    ))
+    has_money = bool(MONEY_RE.search(page_text or ""))
+    return has_totals and has_money
 
 
 def _ocr_page(page) -> str:
@@ -172,24 +296,45 @@ def find_candidate_pages(pdf_bytes: bytes) -> tuple[list[tuple[int, str]], bool]
     try:
         text_pages = []
         candidates = []
+        financial_candidates = []
         for page_number, page in enumerate(document):
             page_text = page.get_text("text")
             text_pages.append((page_number, page_text))
             if _looks_like_summary(page_text):
                 candidates.append((page_number, page_text))
+            elif _looks_like_financial_summary(page_text):
+                financial_candidates.append((page_number, page_text))
         if candidates:
             return candidates, False
+        # Many vendor invoices contain a financial totals page but do not yet
+        # contain the Juniper GL approval block. Allow manual GL entry on that page.
+        if financial_candidates:
+            return financial_candidates, False
 
         ocr_candidates = []
+        ocr_financial_candidates = []
+        ocr_available = True
         for page_number, page in enumerate(document):
             try:
                 page_text = _ocr_page(page)
             except Exception:
+                ocr_available = False
                 # Continue to other pages; user-facing errors remain generic.
                 continue
             if _looks_like_summary(page_text):
                 ocr_candidates.append((page_number, page_text))
-        return ocr_candidates, True
+            elif _looks_like_financial_summary(page_text):
+                ocr_financial_candidates.append((page_number, page_text))
+        if ocr_candidates:
+            return ocr_candidates, True
+        if ocr_financial_candidates:
+            return ocr_financial_candidates, True
+        # Last-resort manual mode: expose a small set of final pages so the user
+        # can choose where to place the stamp even if labels are unrecognized.
+        nonempty_pages = [(n, t) for n, t in text_pages if t.strip()]
+        if nonempty_pages:
+            return nonempty_pages[-5:], not ocr_available
+        return [], not ocr_available
     finally:
         document.close()
 
@@ -295,7 +440,7 @@ st.markdown("""
 </style>
 <div class="hero">
 <h1>PDF Approval Stamp Tool</h1>
-<p>Extract details, validate approval totals, and stamp a separate copy of an invoice.</p>
+<p>Extract Juniper GL details, validate approval totals, and stamp a separate copy of an invoice.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -321,11 +466,14 @@ if uploaded_pdf is not None:
         st.stop()
 
     if used_ocr:
-        st.info("The PDF did not contain a detectable text summary. OCR was used to search scanned pages; please verify every extracted value before stamping.")
+        st.info("The PDF did not contain a detectable text summary in its embedded text. OCR was attempted; verify every extracted value before stamping.")
     if not candidate_pages:
-        st.error("No GL summary was detected, even after OCR. Confirm that the PDF contains a readable summary page, or use a clearer scan.")
-        st.caption("OCR requires the Tesseract OCR engine to be installed on the computer running this app.")
+        st.error("No readable page text was detected. You can still use the tool only after selecting a readable PDF or installing/configuring OCR for scanned pages.")
         st.stop()
+
+    has_gl_summary = any(_looks_like_summary(page_text) for _, page_text in candidate_pages)
+    if not has_gl_summary:
+        st.warning("No pre-existing Juniper GL approval block was detected. GL codes are mapped from invoice summary labels; review the detected amounts and enter approval details if they are absent.")
 
     page_labels = [f"Page {page_number + 1}" for page_number, _ in candidate_pages]
     selected_page_label = st.selectbox(
@@ -358,7 +506,7 @@ if uploaded_pdf is not None:
     with first:
         default_total = float(extracted["total"]) if extracted["total"] is not None else 0.0
         invoice_total = st.number_input(
-            "Total amount", min_value=0.0, value=default_total, step=0.01, format="%.2f"
+            "Total amount (verify or enter manually)", min_value=0.0, value=default_total, step=0.01, format="%.2f"
         )
     with second:
         approver_name = st.text_input("Approved by", value=extracted["approver"])
