@@ -47,6 +47,7 @@ REGION_RULES = {
     "NA and LATAM": {},
     "UK": {},
     "EMEA & APAC": {},
+    "India": {},
 }
 REGION_ALIASES = {
     "NA/LATAM": "NA and LATAM",
@@ -60,6 +61,188 @@ GL_RE = re.compile(r"(?<!\d)(\d{19})(?!\d)")
 MONEY_RE = re.compile(r"\$?\s*([\d,]+\.\d{2})")
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
 APPROVAL_RE = re.compile(r"Approved\s+by\s+(.+?)\s+(\d{2}[./-]\d{2}[./-]\d{4})", re.I)
+
+
+
+
+def _india_clean_text(value: str) -> str:
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _india_amount(value: str) -> Optional[float]:
+    cleaned = str(value or "").replace(",", "").replace("₹", "").strip()
+    match = re.search(r"-?\d+(?:\.\d{1,2})?", cleaned)
+    return round(float(match.group(0)), 2) if match else None
+
+
+def _india_parse_invoice(pdf_bytes: bytes) -> dict:
+    """Extract invoice identity and tax summary from a vendor PDF, in memory."""
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        pages_text = [page.get_text("text") for page in doc]
+    finally:
+        doc.close()
+    text = "\n".join(pages_text)
+    flat = _india_clean_text(text)
+    # NCR invoice number is shown beside NUMBER / DATE on the invoice header.
+    inv_match = re.search(r"\b(CSDL\d+|CSGJ\d+|CSHR\d+|CSKA\d+|CSMH\d+|CSMN\d+|CSTN\d+|CSTS\d+|CSUP\d+)\b", flat, re.I)
+    gstin_match = re.search(r"\bGSTIN\s*:?\s*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9])\b", flat, re.I)
+    # Prefer the supplier GSTIN printed in the invoice header. The buyer GSTIN
+    # is later under "Bill to", so capture the first GSTIN occurrence.
+    if gstin_match:
+        gstin = gstin_match.group(1).upper()
+    else:
+        gstin = ""
+    date_match = re.search(r"\b(\d{2}/\d{2}/\d{2,4})\b", flat)
+    invoice_date = ""
+    if date_match:
+        raw = date_match.group(1)
+        for fmt in ("%d/%m/%y", "%d/%m/%Y"):
+            try:
+                invoice_date = datetime.strptime(raw, fmt).strftime("%m/%d/%Y")
+                break
+            except ValueError:
+                pass
+
+    def value_after(patterns):
+        for pattern in patterns:
+            m = re.search(pattern, text, re.I)
+            if m:
+                return _india_amount(m.group(1))
+        return None
+
+    net = value_after([
+        r"\bSubtotal\b\s*(?:\[INR\])?\s*([₹]?\s*[\d,]+\.\d{2})",
+        r"\bSubtotal\b[\s\S]{0,100}?([₹]?\s*[\d,]+\.\d{2})",
+    ])
+    def tax_amount_on_line(label_pattern):
+        for line in text.splitlines():
+            if re.search(label_pattern, line, re.I):
+                matches = re.findall(r"\d[\d,]*\.\d{2}", line)
+                # Tax lines often contain a rate (e.g. 18.00) before the tax value.
+                if matches:
+                    return _india_amount(matches[-1])
+        # Some PDFs split the tax label, rate, and amount across adjacent lines.
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if re.search(label_pattern, line, re.I):
+                chunk = " ".join(lines[i:i + 3])
+                matches = re.findall(r"\d[\d,]*\.\d{2}", chunk)
+                if matches:
+                    return _india_amount(matches[-1])
+        return None
+
+    has_igst = bool(re.search(r"\bIGST\b", text, re.I))
+    has_cgst = bool(re.search(r"\bCGST\b", text, re.I))
+    has_sgst = bool(re.search(r"\b(?:SGST|UTGST)\b", text, re.I))
+    total = value_after([
+        r"\bINVOICE TOTAL\b[\s\S]{0,80}?([₹]?\s*[\d,]+\.\d{2})",
+        r"\bTOTAL AMOUNT\b[\s\S]{0,80}?([₹]?\s*[\d,]+\.\d{2})",
+    ])
+    # Summary PDFs may put the tax label, rate, and tax amount in separate
+    # text blocks. Derive total tax from invoice total minus subtotal, then
+    # use the template's single-tax-field convention for intra-state invoices.
+    tax_total = round(total - net, 2) if total is not None and net is not None else None
+    igst = tax_total if has_igst else None
+    cgst = round(tax_total / 2, 2) if has_cgst and has_sgst and tax_total is not None else None
+    sgst = cgst if has_cgst and has_sgst else None
+    tax_field = igst if has_igst else cgst
+    tax_type = "IGST" if has_igst else ("CGST/SGST" if has_cgst and has_sgst else "")
+    return {
+        "invoice_number": inv_match.group(1).upper() if inv_match else "",
+        "gstin": gstin,
+        "invoice_date": invoice_date,
+        "net": net,
+        "igst": igst,
+        "cgst": cgst,
+        "sgst": sgst,
+        "tax_field": tax_field,
+        "tax_type": tax_type,
+        "invoice_total": total,
+    }
+
+
+def _india_make_csv(template_bytes: bytes, pdf_uploads, quarter: str, year: int):
+    """Fill blank AP upload template fields using invoice number + supplier GSTIN."""
+    try:
+        frame = pd.read_excel(BytesIO(template_bytes), sheet_name="NCR", dtype=object)
+    except Exception:
+        frame = pd.read_excel(BytesIO(template_bytes), dtype=object)
+    frame.columns = [_india_clean_text(c) for c in frame.columns]
+    required = ["Invoice Number", "GSTIN", "Amount- Duty/IGST", "Tax field", "Total (amount+tax)", "Inv Date", "Line Description"]
+    missing = [c for c in required if c not in frame.columns]
+    if missing:
+        raise ValueError("The uploaded template is missing required columns.")
+
+    pdf_records = {}
+    duplicates = []
+    for uploaded in pdf_uploads:
+        record = _india_parse_invoice(uploaded.getvalue())
+        if not record["invoice_number"] or not record["gstin"]:
+            continue
+        key = (record["invoice_number"].upper(), record["gstin"].upper())
+        if key in pdf_records:
+            duplicates.append(key[0])
+        pdf_records[key] = record
+
+    results = []
+    unmatched = []
+    for idx, row in frame.iterrows():
+        invoice_number = _india_clean_text(row.get("Invoice Number", "")).upper()
+        gstin = _india_clean_text(row.get("GSTIN", "")).upper()
+        # The supplied blank template may carry the invoice number only in the
+        # existing line description; use it as a matching key without treating
+        # screenshot/reference values as source invoice data.
+        if not invoice_number:
+            description = _india_clean_text(row.get("Line Description", ""))
+            inferred = re.search(r"\b(CSDL\d+|CSGJ\d+|CSHR\d+|CSKA\d+|CSMH\d+|CSMN\d+|CSTN\d+|CSTS\d+|CSUP\d+)\b", description, re.I)
+            if inferred:
+                invoice_number = inferred.group(1).upper()
+        if not invoice_number and not gstin:
+            continue
+        record = pdf_records.get((invoice_number, gstin))
+        if record is None:
+            unmatched.append(invoice_number or f"Excel row {idx + 2}")
+            continue
+        if record["gstin"] != gstin:
+            unmatched.append(invoice_number)
+            continue
+        if pd.isna(row.get("Invoice Number")) or not _india_clean_text(row.get("Invoice Number", "")):
+            frame.at[idx, "Invoice Number"] = invoice_number
+
+        # Fill missing values only; preserve pre-populated template data except
+        # the line description, which follows the user-selected quarter/year.
+        net = record["net"]
+        tax = record["tax_field"]
+        if pd.isna(row.get("Amount- Duty/IGST")) and net is not None:
+            frame.at[idx, "Amount- Duty/IGST"] = net
+        if pd.isna(row.get("Tax field")) and tax is not None:
+            frame.at[idx, "Tax field"] = tax
+        if pd.isna(row.get("Total (amount+tax)")):
+            if net is not None and tax is not None:
+                frame.at[idx, "Total (amount+tax)"] = round(net + tax, 2)
+            elif record["invoice_total"] is not None:
+                frame.at[idx, "Total (amount+tax)"] = record["invoice_total"]
+        if pd.isna(row.get("Inv Date")) and record["invoice_date"]:
+            frame.at[idx, "Inv Date"] = record["invoice_date"]
+        frame.at[idx, "Line Description"] = f"NCR TPM {quarter} {year} Invoice {invoice_number}"
+        results.append({
+            "Invoice Number": invoice_number,
+            "GSTIN": gstin,
+            "Net": net,
+            "Tax field": tax,
+            "Tax type": record["tax_type"],
+            "PDF invoice total": record["invoice_total"],
+            "CSV total (amount+tax)": frame.at[idx, "Total (amount+tax)"],
+        })
+
+    return frame, results, unmatched, duplicates
+
 
 
 def normalize_region(value: str) -> str:
@@ -642,11 +825,58 @@ with st.sidebar:
     st.header("Processing rules")
     st.caption("Select the region for the invoice you are processing.")
     selected_region = st.selectbox("Invoice region", list(REGION_RULES.keys()))
-    stamp_placement = st.selectbox(
-        "Stamp placement",
-        ["Center in available blank space", "Bottom of summary page"],
-    )
+    if selected_region != "India":
+        stamp_placement = st.selectbox(
+            "Stamp placement",
+            ["Center in available blank space", "Bottom of summary page"],
+        )
+    else:
+        stamp_placement = "Center in available blank space"
     st.caption("Region-specific validation rules are applied automatically.")
+
+if selected_region == "India":
+    st.subheader("India — NCR AP Upload CSV")
+    st.caption("Upload the blank AP Excel template and the invoice PDFs. Matching requires both invoice number and supplier GSTIN.")
+    qcol, ycol = st.columns(2)
+    with qcol:
+        selected_quarter = st.selectbox("Invoice quarter", ["Q1", "Q2", "Q3", "Q4"], index=3)
+    with ycol:
+        selected_year = st.selectbox("Invoice year", list(range(datetime.now().year - 2, datetime.now().year + 4)), index=2)
+    template_file = st.file_uploader("Upload NCR Invoice AP Upload Excel template", type=["xlsx"], key="india_template")
+    india_pdfs = st.file_uploader("Upload matching invoice PDFs", type=["pdf"], accept_multiple_files=True, key="india_pdfs")
+    if template_file and india_pdfs:
+        if st.button("Generate India CSV", type="primary", use_container_width=True):
+            try:
+                with st.spinner("Matching invoice numbers and supplier GSTINs..."):
+                    india_frame, india_results, india_unmatched, india_duplicates = _india_make_csv(
+                        template_file.getvalue(), india_pdfs, selected_quarter, int(selected_year)
+                    )
+                st.session_state["india_csv_bytes"] = india_frame.to_csv(index=False, date_format="%m/%d/%Y").encode("utf-8-sig")
+                st.session_state["india_csv_name"] = f"NCR Invoice AP Upload file {datetime.now().strftime('%m.%d.%Y')}.csv"
+                st.session_state["india_results"] = india_results
+                st.session_state["india_unmatched"] = india_unmatched
+                st.session_state["india_duplicates"] = india_duplicates
+                st.success(f"CSV prepared with {len(india_results)} matched invoice record(s).")
+            except Exception:
+                st.error("The India template or invoice PDFs could not be processed. Check the template columns and PDF files.")
+        if st.session_state.get("india_results") is not None:
+            st.subheader("Matched invoice review")
+            review = pd.DataFrame(st.session_state["india_results"])
+            st.dataframe(review, use_container_width=True, hide_index=True)
+            if st.session_state.get("india_unmatched"):
+                st.warning("Some template rows did not match both invoice number and supplier GSTIN. Those rows were not filled: " + ", ".join(st.session_state["india_unmatched"]))
+            if st.session_state.get("india_duplicates"):
+                st.warning("Duplicate invoice PDFs were uploaded for: " + ", ".join(st.session_state["india_duplicates"]))
+            st.download_button(
+                "Download NCR Invoice AP Upload CSV",
+                data=st.session_state["india_csv_bytes"],
+                file_name=st.session_state["india_csv_name"],
+                mime="text/csv",
+                use_container_width=True,
+            )
+    else:
+        st.info("Upload the Excel template and the corresponding invoice PDFs to generate the India CSV.")
+    st.stop()
 
 uploaded_pdf = st.file_uploader("Upload invoice PDF", type=["pdf"])
 
