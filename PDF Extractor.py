@@ -25,7 +25,6 @@ import pandas as pd
 import pytesseract
 from PIL import Image
 from io import BytesIO
-from datetime import date
 
 st.set_page_config(page_title="PDF Approval Stamp Tool", page_icon="📄", layout="wide", initial_sidebar_state="expanded")
 
@@ -40,69 +39,25 @@ header[data-testid="stHeader"] {visibility: hidden !important; height: 0 !import
 </style>
 """, unsafe_allow_html=True)
 
-# Encoded configuration keeps organization-specific labels and GL suffix mappings
-# out of plain sight in this source file. This is obfuscation, not encryption.
-_RULES_B64 = "eyJyb2xlcyI6eyJJUExTIjp7InZhdF9zdWZmaXgiOiIyMSIsIm5ldF9zdWZmaXgiOiIxOSJ9LCJBVSI6eyJ2YXRfc3VmZml4IjoiMjMiLCJuZXRfc3VmZml4IjoiMTkifSwiTkEgYW5kIExBVEFNIjp7InZhdF9zdWZmaXgiOiIyMSIsIm5ldF9zdWZmaXgiOiIxOSJ9LCJVSyI6eyJ2YXRfc3VmZml4IjoiMjEiLCJuZXRfc3VmZml4IjoiMTkifSwiRU1FQSAmIEFQQUMiOnsidmF0X3N1ZmZpeCI6IjIxIiwibmV0X3N1ZmZpeCI6IjE5In19LCJhbGlhc2VzIjp7Ik5BL0xBVEFNIjoiTkEgYW5kIExBVEFNIiwiTkEgJiBMQVRBTSI6Ik5BIGFuZCBMQVRBTSIsIkVNRUEgQVBBQyI6IkVNRUEgJiBBUEFDIiwiRU1FQS9BUEFDIjoiRU1FQSAmIEFQQUMifSwibmV0X2xhYmVsIjoiTkNSIENFIG9uLXNpdGUgY29zdCAvIFN1YnRvdGFsIiwidmF0X2xhYmVsIjoiVkFUIC8gR1NUIiwibGFiZWxfdGVybXMiOnsibmV0IjpbIk5FVCBBTU9VTlQgKFVTRCkiLCJORVQgQU1PVU5UKFVTRCkiLCJORVQgQU1PVU5UIiwiU1VCVE9UQUwiXSwidmF0IjpbIlRPVEFMIFJFR0lPTiBWQVQvVEFYRVMgKFVTRCkiLCJUT1RBTCBSRUdJT04gVkFUL1RBWEVTKFVTRCkiLCJUT1RBTCBSRUdJT04gVkFUL1RBWEVTIiwiVE9UQUwgRy5TLlQiLCJUT1RBTCBHU1QiLCJWQVQiXSwidG90YWwiOlsiVE9UQUwgQU1PVU5UIChVU0QpIiwiVE9UQUwgQU1PVU5UKFVTRCkiLCJUT1RBTCBBTU9VTlQiLCJJTlZPSUNFIFRPVEFMIiwiQU1PVU5UIl19fQ=="
-try:
-    _CONFIG = json.loads(base64.b64decode(_RULES_B64).decode("utf-8"))
-except Exception:
-    # Safe fallback retains functionality if the encoded configuration is damaged.
-    _CONFIG = {
-        "roles": {
-            "IPLS": {"vat_suffix": "21", "net_suffix": "19"},
-            "AU": {"vat_suffix": "23", "net_suffix": "19"},
-            "NA and LATAM": {"vat_suffix": "21", "net_suffix": "19"},
-            "UK": {"vat_suffix": "21", "net_suffix": "19"},
-            "EMEA & APAC": {"vat_suffix": "21", "net_suffix": "19"},
-        },
-        "aliases": {},
-        "label_terms": {
-            "net": ["NET AMOUNT (USD)", "NET AMOUNT(USD)", "NET AMOUNT"],
-            "vat": ["TOTAL REGION VAT/TAXES (USD)", "TOTAL REGION VAT/TAXES", "TOTAL G.S.T", "TOTAL GST"],
-            "total": ["TOTAL AMOUNT (USD)", "TOTAL AMOUNT(USD)", "TOTAL AMOUNT", "INVOICE TOTAL"],
-        },
-    }
-def _apply_secret_configuration(config: dict) -> dict:
-    """Override regional GL mappings from Streamlit secrets when configured."""
-    try:
-        secret_regions = st.secrets.get("regional_gl", {})
-        if hasattr(secret_regions, "items"):
-            for region_name, values in secret_regions.items():
-                if not hasattr(values, "get"):
-                    continue
-                normalized = normalize_region(region_name) if "normalize_region" in globals() else str(region_name).strip()
-                config.setdefault("gl_codes", {})[normalized] = {
-                    "net": str(values.get("net", "")).strip(),
-                    "vat": str(values.get("vat", "")).strip(),
-                }
-    except Exception:
-        # Missing or malformed secrets should not prevent the app from starting.
-        pass
-    return config
-
-
-_CONFIG = _apply_secret_configuration(_CONFIG)
-# GL codes must only come from Streamlit secrets, never embedded defaults.
-_CONFIG.pop("gl_codes", None)
-REGION_RULES = _CONFIG["roles"]
-REGION_ALIASES = {key.upper(): value for key, value in _CONFIG.get("aliases", {}).items()}
-NET_LABEL = _CONFIG.get("net_label", "NCR CE on-site cost / Subtotal")
-VAT_LABEL = _CONFIG.get("vat_label", "VAT / GST")
+# Region names and aliases are not sensitive. All full GL codes are read only from Streamlit secrets.
+REGION_RULES = {
+    "IPLS": {},
+    "AU": {},
+    "NA and LATAM": {},
+    "UK": {},
+    "EMEA & APAC": {},
+}
+REGION_ALIASES = {
+    "NA/LATAM": "NA and LATAM",
+    "NA & LATAM": "NA and LATAM",
+    "EMEA APAC": "EMEA & APAC",
+    "EMEA/APAC": "EMEA & APAC",
+}
+NET_LABEL = "Net Amount / Subtotal"
+VAT_LABEL = "VAT / GST"
 GL_RE = re.compile(r"(?<!\d)(\d{19})(?!\d)")
 MONEY_RE = re.compile(r"\$?\s*([\d,]+\.\d{2})")
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
-
-
-def get_approval_defaults():
-    """Read default approver identity from Streamlit secrets without hardcoding it."""
-    try:
-        approval_secrets = st.secrets.get("approval", {})
-        name = str(approval_secrets.get("approved_by", "")).strip()
-        email = str(approval_secrets.get("email", "")).strip()
-        return name, email
-    except Exception:
-        # Missing secrets should not prevent the app from running.
-        return "", ""
 APPROVAL_RE = re.compile(r"Approved\s+by\s+(.+?)\s+(\d{2}[./-]\d{2}[./-]\d{4})", re.I)
 
 
@@ -116,328 +71,106 @@ def money_after(text: str, start: int = 0) -> Optional[float]:
     return float(match.group(1).replace(",", "")) if match else None
 
 
-def _amount_near_label(text: str, labels: list[str]) -> Optional[float]:
-    """Extract a labeled amount from common invoice layouts, including column tables.
-
-    Handles labels and amounts on the same line, labels on a header row with a
-    separate values row, and OCR/PDF extraction that separates currency symbols.
-    """
-    raw_lines = [line.rstrip() for line in (text or "").splitlines() if line.strip()]
-    norm_lines = [re.sub(r"\s+", " ", line).strip() for line in raw_lines]
-    upper_lines = [line.upper() for line in norm_lines]
-    norm_labels = [re.sub(r"\s+", " ", label.upper()).strip() for label in labels]
-
-    # First, parse line-level label/value pairs without crossing another known label.
-    all_labels = [
-        "NET AMOUNT (USD)", "NET AMOUNT(USD)", "NET AMOUNT",
-        "TOTAL REGION VAT/TAXES (USD)", "TOTAL REGION VAT/TAXES(USD)",
-        "TOTAL REGION VAT/TAXES", "TOTAL G.S.T", "TOTAL GST",
-        "TOTAL AMOUNT (USD)", "TOTAL AMOUNT(USD)", "TOTAL AMOUNT",
-        "INVOICE TOTAL", "SUBTOTAL", "AMOUNT DUE"
-    ]
-    for i, upper in enumerate(upper_lines):
-        if not any(label in upper for label in norm_labels):
-            continue
-        # If line contains several labels (table header row), don't bind a later
-        # column's value to the first label. Prefer same-line amounts only when
-        # this line itself contains a single summary label.
-        present = [lab for lab in all_labels if lab in upper]
-        same = list(MONEY_RE.finditer(norm_lines[i]))
-        if same and len(present) <= 1:
-            return float(same[-1].group(1).replace(",", ""))
-
-        # Search following rows first for the values row; stop at the next summary
-        # header. Use the first currency amount for a single-label column.
-        for j in range(i + 1, min(len(norm_lines), i + 5)):
-            candidate_upper = upper_lines[j]
-            if any(lab in candidate_upper for lab in all_labels):
-                break
-            matches = list(MONEY_RE.finditer(norm_lines[j]))
-            if matches:
-                # For a table values row with multiple amounts, select by the
-                # ordinal position of the label among summary columns.
-                # Build ordered, non-overlapping summary columns (longest match wins
-                # when e.g. NET AMOUNT is contained in NET AMOUNT (USD)).
-                label_positions = []
-                for lab in sorted(set(all_labels), key=len, reverse=True):
-                    pos = upper.find(lab)
-                    if pos >= 0 and not any(not (pos + len(lab) <= old_pos or pos >= old_pos + len(old_lab)) for old_pos, old_lab in label_positions):
-                        label_positions.append((pos, lab))
-                label_positions.sort()
-                requested = next((lab for lab in sorted(norm_labels, key=len, reverse=True) if lab in upper), None)
-                if len(matches) > 1 and requested:
-                    matching_pos = upper.find(requested)
-                    # Use the leftmost matching summary label's column position.
-                    ordinal = sum(1 for pos, _ in label_positions if pos < matching_pos)
-                    if ordinal < len(matches):
-                        return float(matches[ordinal].group(1).replace(",", ""))
-                return float(matches[0].group(1).replace(",", ""))
-
-        # A few PDF extractors emit the amount before the label.
-        for j in range(i - 1, max(-1, i - 4), -1):
-            if any(lab in upper_lines[j] for lab in all_labels):
-                break
-            matches = list(MONEY_RE.finditer(norm_lines[j]))
-            if matches:
-                return float(matches[-1].group(1).replace(",", ""))
-
-    # Flattened text: map each summary label to the nearest amount before the next label.
-    compact = re.sub(r"\s+", " ", text or "")
-    label_pattern = r"NET\s*AMOUNT\s*\(?\s*USD\s*\)?|TOTAL\s+REGION\s+VAT\s*/\s*TAXES\s*\(?\s*USD\s*\)?|TOTAL\s+G\.?S\.?T\.?|TOTAL\s+GST|TOTAL\s+AMOUNT\s*\(?\s*USD\s*\)?|INVOICE\s+TOTAL|SUBTOTAL|\bVAT\b|\bAMOUNT\b|AMOUNT\s+DUE"
-    for label in labels:
-        match = re.search(re.escape(label), compact, re.I)
-        if match:
-            tail = compact[match.end():]
-            next_label = re.search(label_pattern, tail, re.I)
-            segment = tail[:next_label.start()] if next_label else tail[:120]
-            amount = money_after(segment)
-            if amount is not None:
-                return amount
-    return None
-
-
-def _region_gl_codes(region: str) -> dict:
-    """Read full GL codes exclusively from Streamlit secrets; never hardcode GL values."""
-    region = normalize_region(region)
-    try:
-        secret_regions = st.secrets.get("regional_gl", {})
-        for name, values in secret_regions.items():
-            if normalize_region(name) == region and hasattr(values, "get"):
-                return {
-                    "net": str(values.get("net", "")).strip(),
-                    "vat": str(values.get("vat", "")).strip(),
-                }
-    except Exception:
-        pass
-    return {"net": "", "vat": ""}
-
-
-def _direct_label_amount(text: str, labels: list[str]) -> Optional[float]:
-    """Get the amount associated with a label without borrowing a value from another row."""
-    lines = [re.sub(r"\s+", " ", line).strip() for line in (text or "").splitlines() if line.strip()]
-    upper_lines = [line.upper() for line in lines]
-    stop_labels = (
-        "NET AMOUNT", "TOTAL G.S.T", "TOTAL GST", "TOTAL REGION VAT/TAXES",
-        "SUBTOTAL", "VAT", "TOTAL AMOUNT", "INVOICE TOTAL", "AMOUNT DUE",
-    )
-    for index, line in enumerate(lines):
-        upper = upper_lines[index]
-        matched = next((label for label in sorted(labels, key=len, reverse=True) if label.upper() in upper), None)
-        if not matched:
-            continue
-        # Same-line amount: only use the amount after the matching label.
-        label_match = re.search(re.escape(matched), line, re.I)
-        if label_match:
-            same_line_amount = money_after(line, label_match.end())
-            if same_line_amount is not None:
-                return same_line_amount
-        # Label and amount may be split across lines in text extraction.
-        for next_index in range(index + 1, min(len(lines), index + 4)):
-            next_upper = upper_lines[next_index]
-            if any(stop in next_upper for stop in stop_labels):
-                break
-            values = list(MONEY_RE.finditer(lines[next_index]))
-            if values:
-                return float(values[0].group(1).replace(",", ""))
-        # In some PDFs the value is placed before the label in reading order.
-        for previous_index in range(index - 1, max(-1, index - 3), -1):
-            if any(stop in upper_lines[previous_index] for stop in stop_labels):
-                break
-            values = list(MONEY_RE.finditer(lines[previous_index]))
-            if values:
-                return float(values[-1].group(1).replace(",", ""))
-    return None
-
-
-def extract_labeled_gl_rows(text: str, region: str) -> tuple[list[dict], Optional[float]]:
-    """Extract only the two region-specific summary amounts using the screenshot's labels."""
-    region = normalize_region(region)
-    region_codes = _region_gl_codes(region)
-    lines = [re.sub(r"\s+", " ", line).strip() for line in (text or "").splitlines() if line.strip()]
-    upper_lines = [line.upper() for line in lines]
-    all_text_upper = re.sub(r"\s+", " ", (text or "").upper())
-
-    # AU: values sit beside explicit labels "Net Amount" and "Total G.S.T".
-    # UK: use "SUBTOTAL" and "VAT" values, not the VAT percentage.
-    # NA/LATAM and EMEA/APAC: use the values under the two specified USD headers.
-    if region == "AU":
-        net_labels = ["NET AMOUNT (USD)", "NET AMOUNT(USD)", "NET AMOUNT"]
-        tax_labels = ["TOTAL G.S.T", "TOTAL GST"]
-    elif region == "UK":
-        net_labels = ["SUBTOTAL"]
-        tax_labels = ["VAT"]
-    else:
-        net_labels = ["NET AMOUNT (USD)", "NET AMOUNT(USD)"]
-        tax_labels = ["TOTAL REGION VAT/TAXES (USD)", "TOTAL REGION VAT/TAXES(USD)", "TOTAL REGION VAT/TAXES"]
-
-    net_amount = _direct_label_amount(text, net_labels)
-    vat_amount = _direct_label_amount(text, tax_labels)
-    if net_amount is None:
-        net_amount = _amount_near_label(text, net_labels)
-    if vat_amount is None:
-        vat_amount = _amount_near_label(text, tax_labels)
-
-    # For table-style headings, associate each heading with the amount in its own
-    # column on the following value row. This avoids grabbing a subtotal, VAT rate,
-    # line-item amount, or the final invoice total from another part of the page.
-    def column_values_for_header(header_terms):
-        for idx, line in enumerate(upper_lines):
-            positions = []
-            for term in header_terms:
-                pos = line.find(term.upper())
-                if pos >= 0:
-                    positions.append((pos, term))
-            if not positions:
-                continue
-            target_pos = min(pos for pos, _ in positions)
-            for value_line_idx in range(idx + 1, min(len(lines), idx + 5)):
-                value_line = lines[value_line_idx]
-                money_matches = list(MONEY_RE.finditer(value_line))
-                if not money_matches:
-                    continue
-                # If the next line contains another heading, do not cross into it.
-                if any(term in upper_lines[value_line_idx] for term in (
-                    "NET AMOUNT", "TOTAL REGION VAT/TAXES", "TOTAL G.S.T", "TOTAL GST",
-                    "SUBTOTAL", "VAT", "TOTAL AMOUNT", "INVOICE TOTAL"
-                )):
-                    break
-                # Use x/character position where possible. If values are a row of
-                # two or three amounts, map the header's horizontal order to amount order.
-                header_positions = []
-                for terms in (net_labels, tax_labels, ["TOTAL AMOUNT (USD)", "TOTAL AMOUNT(USD)", "TOTAL AMOUNT", "AMOUNT"]):
-                    found = [line.find(term.upper()) for term in terms if line.find(term.upper()) >= 0]
-                    if found:
-                        header_positions.append(min(found))
-                header_positions = sorted(set(header_positions))
-                ordinal = sum(1 for pos in header_positions if pos < target_pos)
-                if len(money_matches) >= len(header_positions) and ordinal < len(money_matches):
-                    return float(money_matches[ordinal].group(1).replace(",", ""))
-                # Single-value rows, including AU and UK, use the first amount on
-                # the first following value line.
-                return float(money_matches[0].group(1).replace(",", ""))
-        return None
-
-    if net_amount is None:
-        net_amount = column_values_for_header(net_labels)
-    if vat_amount is None:
-        vat_amount = column_values_for_header(tax_labels)
-
-    # OCR can merge the label and amount into one line. Prefer label-local values.
-    if net_amount is None:
-        for line in lines:
-            upper = line.upper()
-            if any(term in upper for term in net_labels):
-                amount = money_after(line)
-                if amount is not None:
-                    net_amount = amount
-                    break
-    if vat_amount is None:
-        for line in lines:
-            upper = line.upper()
-            if any(term in upper for term in tax_labels):
-                # For UK, ignore the percentage (e.g. 20.00%) and take the last
-                # monetary value, which is the VAT amount.
-                matches = list(MONEY_RE.finditer(line))
-                if matches:
-                    vat_amount = float(matches[-1].group(1).replace(",", ""))
-                    break
-
-    rows = []
-    if net_amount is not None and region_codes.get("net"):
-        rows.append({"Juniper GL Code": region_codes["net"], "Amount": net_amount})
-    if vat_amount is not None and region_codes.get("vat"):
-        rows.append({"Juniper GL Code": region_codes["vat"], "Amount": vat_amount})
-
-    # Total is intentionally calculated from the two extracted GL amounts in the UI.
-    return rows, None
-
-
-
 def extract_region_amounts_from_page(page, region: str) -> tuple[list[dict], Optional[float]]:
-    """Extract regional invoice values by matching label and money tokens by page coordinates."""
+    """Match region-specific summary labels to amounts using PDF coordinates.
+
+    AU and UK use label/value rows. NA/LATAM and EMEA/APAC use USD column
+    headings with values beneath them. GL codes are never read from the invoice.
+    """
     region = normalize_region(region)
     codes = _region_gl_codes(region)
-    if region == "AU":
-        label_sets = {"net": ["NET AMOUNT"], "vat": ["TOTAL G.S.T", "TOTAL GST"]}
-    elif region == "UK":
-        label_sets = {"net": ["SUBTOTAL"], "vat": ["VAT"]}
-    else:
-        label_sets = {
-            "net": ["NET AMOUNT (USD)", "NET AMOUNT(USD)", "NET AMOUNT"],
-            "vat": ["TOTAL REGION VAT/TAXES (USD)", "TOTAL REGION VAT/TAXES(USD)", "TOTAL REGION VAT/TAXES"],
-        }
-
-    # Use positioned words, not reading-order adjacency. This avoids mistaking the
-    # subtotal for VAT when a PDF separates the VAT amount into another text block.
     words = page.get_text("words")
-    normalized_words = [(float(w[0]), float(w[1]), float(w[2]), float(w[3]), str(w[4])) for w in words]
-    page_width, page_height = page.rect.width, page.rect.height
+    words = [(float(w[0]), float(w[1]), float(w[2]), float(w[3]), str(w[4])) for w in words]
+    if not words:
+        return [], None
+
+    def norm(value):
+        return re.sub(r"[^A-Z0-9]+", " ", value.upper()).strip()
+
+    def phrase_boxes(phrase):
+        target = norm(phrase).split()
+        found = []
+        # Group words by approximate baseline, then match phrase within each line.
+        lines = {}
+        for w in words:
+            key = round(w[1] / 5) * 5
+            lines.setdefault(key, []).append(w)
+        for line in lines.values():
+            line.sort(key=lambda w: w[0])
+            for i in range(len(line)):
+                pieces = []
+                for j in range(i, min(len(line), i + len(target) + 3)):
+                    pieces.append(line[j])
+                    got = norm(" ".join(x[4] for x in pieces)).split()
+                    if got == target:
+                        found.append((min(x[0] for x in pieces), min(x[1] for x in pieces),
+                                      max(x[2] for x in pieces), max(x[3] for x in pieces)))
+                        break
+                    if len(got) > len(target) or got != target[:len(got)]:
+                        break
+        return found
+
+    def monetary_words():
+        vals = []
+        for x0, y0, x1, y1, token in words:
+            cleaned = token.replace("$", "").replace(",", "")
+            if re.fullmatch(r"\d+(?:\.\d{2})", cleaned):
+                try:
+                    vals.append((x0, y0, x1, y1, float(cleaned)))
+                except ValueError:
+                    pass
+        return vals
+
+    amounts = monetary_words()
     found = {}
 
-    def norm(s):
-        return re.sub(r"[^A-Z0-9]+", " ", s.upper()).strip()
+    if region == "AU":
+        specs = {
+            "net": ["Net Amount"],
+            "vat": ["Total G.S.T", "Total GST"],
+        }
+    elif region == "UK":
+        specs = {"net": ["SUBTOTAL"], "vat": ["VAT"]}
+    else:
+        specs = {
+            "net": ["NET AMOUNT(USD)", "NET AMOUNT (USD)"],
+            "vat": ["TOTAL REGION VAT/TAXES(USD)", "TOTAL REGION VAT/TAXES (USD)"],
+        }
 
-    # Build candidate label phrases from nearby words on approximately the same line.
-    for kind, labels in label_sets.items():
-        candidates = []
+    for kind, labels in specs.items():
+        boxes = []
         for label in labels:
-            target = norm(label)
-            target_parts = target.split()
-            for i, word in enumerate(normalized_words):
-                x0, y0, x1, y1, token = word
-                # Summary values normally appear in the lower portion of the page.
-                if y0 < page_height * 0.55:
-                    continue
-                if norm(token) != target_parts[0]:
-                    continue
-                collected = [word]
-                combined = norm(token)
-                for nxt in normalized_words[i+1:i+12]:
-                    nx0, ny0, nx1, ny1, nt = nxt
-                    if abs(ny0-y0) > 12 or nx0 < collected[-1][2] - 1 or nx0-x1 > 90:
-                        if ny0-y0 > 12:
-                            break
-                        continue
-                    collected.append(nxt)
-                    combined = norm(" ".join(w[4] for w in collected))
-                    if combined == target or combined.startswith(target + " "):
-                        candidates.append((min(w[0] for w in collected), min(w[1] for w in collected),
-                                           max(w[2] for w in collected), max(w[3] for w in collected), label))
-                        break
-                    if len(norm(" ".join(w[4] for w in collected)).split()) > len(target_parts) + 2:
-                        break
-        if not candidates:
+            boxes.extend(phrase_boxes(label))
+        if not boxes:
             continue
-        # For UK VAT, choose the VAT label in the right-hand financial summary,
-        # not the unrelated GBP Value table or customer VAT number.
-        for lx0, ly0, lx1, ly1, label in candidates:
-            amounts = []
-            for ax0, ay0, ax1, ay1, token in normalized_words:
-                # Only genuine monetary values: comma-grouped amounts or currency-prefixed values.
-                if not (token.startswith("$") or re.fullmatch(r"\d{1,3}(?:,\d{3})+\.\d{2}", token)):
-                    continue
-                value_match = MONEY_RE.search(token)
-                if not value_match:
-                    continue
-                vertical_distance = abs((ay0+ay1)/2 - (ly0+ly1)/2)
-                if vertical_distance > 18:
-                    continue
-                # Label must be immediately left of its value in the same summary row.
-                horizontal_distance = ax0 - lx1
-                if horizontal_distance < -8 or horizontal_distance > 180:
-                    continue
-                amounts.append((vertical_distance, horizontal_distance, float(value_match.group(1).replace(",", ""))))
-            if amounts:
-                amounts.sort(key=lambda item: (item[0], item[1]))
-                found[kind] = amounts[0][2]
-                break
+
+        candidates = []
+        for lx0, ly0, lx1, ly1 in boxes:
+            for ax0, ay0, ax1, ay1, value in amounts:
+                if region in ("NA and LATAM", "EMEA & APAC"):
+                    # Amount must be below its own USD column header. Stop at the
+                    # next column's header by using a column-sized x window.
+                    if ay0 <= ly1 + 8:
+                        continue
+                    if ax0 < lx0 - 35 or ax0 > lx1 + 260:
+                        continue
+                    candidates.append((ay0 - ly1, abs(ax0 - lx0), value))
+                else:
+                    # AU/UK values are printed on the same row, to the right of label.
+                    vertical = abs((ay0 + ay1) / 2 - (ly0 + ly1) / 2)
+                    horizontal = ax0 - lx1
+                    if vertical <= 24 and -5 <= horizontal <= 360:
+                        candidates.append((vertical, horizontal, value))
+        if candidates:
+            candidates.sort(key=lambda v: (v[0], v[1]))
+            found[kind] = candidates[0][2]
 
     rows = []
     if found.get("net") is not None and codes.get("net"):
         rows.append({"Juniper GL Code": codes["net"], "Amount": found["net"]})
     if found.get("vat") is not None and codes.get("vat"):
         rows.append({"Juniper GL Code": codes["vat"], "Amount": found["vat"]})
-    total = round(sum(found[k] for k in ("net", "vat") if found.get(k) is not None), 2) if len(found) == 2 else None
+    total = round(found["net"] + found["vat"], 2) if len(found) == 2 else None
     return rows, total
 
 
@@ -507,18 +240,8 @@ def extract_from_page(text: str, region_hint: Optional[str] = None) -> dict:
                 if total is not None:
                     break
 
-    # The invoice summary labels are the source of truth for amounts. Always
-    # prefer region-specific label extraction when it finds both values, even if
-    # the page also contains old/pre-existing GL codes or a previous stamp.
-    label_rows, label_total = extract_labeled_gl_rows(text, region)
-    if len(label_rows) == 2:
-        rows = label_rows
-    elif not rows and label_rows:
-        rows = label_rows
-    if total is None:
-        total = label_total
-
     if not region:
+        # Conservative inference only; the user can explicitly select the region.
         region = "AU" if any(row["Juniper GL Code"].endswith("23") for row in rows) else ""
 
     return {
@@ -533,26 +256,17 @@ def extract_from_page(text: str, region_hint: Optional[str] = None) -> dict:
 
 
 def _looks_like_summary(page_text: str) -> bool:
-    upper_text = re.sub(r"\s+", " ", (page_text or "").upper())
-    has_gl_block = "JUNIPER GL CODE" in upper_text and ("TOTAL AMOUNT" in upper_text or "APPROVED BY" in upper_text)
-    labels = _CONFIG.get("label_terms", {})
-    has_net = any(term.upper() in upper_text for term in labels.get("net", ["NET AMOUNT", "SUBTOTAL"]))
-    has_tax = any(term.upper() in upper_text for term in labels.get("vat", ["TOTAL G.S.T", "TOTAL GST", "VAT"]))
-    has_total = any(term.upper() in upper_text for term in labels.get("total", ["TOTAL AMOUNT", "INVOICE TOTAL", "AMOUNT"]))
-    has_region_pair = (
-        ("NET AMOUNT" in upper_text and ("TOTAL G.S.T" in upper_text or "TOTAL GST" in upper_text))
-        or ("NET AMOUNT" in upper_text and "TOTAL REGION VAT/TAXES" in upper_text)
-        or ("SUBTOTAL" in upper_text and "VAT" in upper_text)
+    upper_text = page_text.upper()
+    return "JUNIPER GL CODE" in upper_text and (
+        "TOTAL AMOUNT" in upper_text or "APPROVED BY" in upper_text
     )
-    return has_gl_block or has_region_pair or (has_net and has_tax and has_total)
 
 
 def _looks_like_financial_summary(page_text: str) -> bool:
     """Recognize invoice totals pages even when no GL approval block exists."""
     upper_text = re.sub(r"\s+", " ", (page_text or "").upper())
     has_totals = any(label in upper_text for label in (
-        "SUBTOTAL", "TOTAL G.S.T", "TOTAL GST", "TOTAL REGION VAT/TAXES",
-        "TOTAL AMOUNT", "INVOICE TOTAL", "AMOUNT DUE", " VAT ", " AMOUNT "
+        "SUBTOTAL", "TOTAL G.S.T", "TOTAL GST", "TOTAL AMOUNT", "INVOICE TOTAL", "AMOUNT DUE"
     ))
     has_money = bool(MONEY_RE.search(page_text or ""))
     return has_totals and has_money
@@ -618,14 +332,30 @@ def find_candidate_pages(pdf_bytes: bytes) -> tuple[list[tuple[int, str]], bool]
         document.close()
 
 
+def _region_gl_codes(region: str) -> dict:
+    """Read full GL codes exclusively from Streamlit secrets."""
+    region = normalize_region(region)
+    try:
+        regional = st.secrets.get("regional_gl", {})
+        for name, values in regional.items():
+            if normalize_region(str(name)) == region and hasattr(values, "get"):
+                return {
+                    "net": str(values.get("net", "")).strip(),
+                    "vat": str(values.get("vat", "")).strip(),
+                }
+    except Exception:
+        pass
+    return {"net": "", "vat": ""}
+
+
 def classify_rows(region: str, rows: list[dict]) -> list[dict]:
-    region_codes = _region_gl_codes(region)
+    codes = _region_gl_codes(region)
     classified = []
     for row in rows:
-        code = str(row["Juniper GL Code"])
-        if code == str(region_codes.get("net", "")):
+        code = str(row.get("Juniper GL Code", "")).strip()
+        if code and code == codes.get("net"):
             label = NET_LABEL
-        elif code == str(region_codes.get("vat", "")):
+        elif code and code == codes.get("vat"):
             label = VAT_LABEL
         else:
             label = "Review — region/code not mapped"
@@ -662,7 +392,12 @@ def stamp_pdf(
     email: str,
     placement: str,
 ) -> bytes:
-    """Place the stamp centered in a detected blank area without covering invoice content."""
+    """Place the approval stamp centered in a genuinely unoccupied area.
+
+    The search uses page text block coordinates so it works across invoice layouts
+    where the summary may be at the top, bottom, or side of the page. If no safe
+    rectangle can fit the complete stamp, fail rather than cover invoice content.
+    """
     document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     try:
         page = document[page_index]
@@ -671,62 +406,119 @@ def stamp_pdf(
         line_gap = 12
         stamp_lines = ["JUNIPER GL CODE                                      AMOUNT"]
         for row in rows:
-            stamp_lines.append(f'{row["Juniper GL Code"]}    ${float(row["Amount"]):,.2f}')
+            stamp_lines.append(
+                f'{row["Juniper GL Code"]}    ${float(row["Amount"]):,.2f}'
+            )
         stamp_lines.append(f"TOTAL AMOUNT    ${float(total):,.2f}")
         stamp_lines.append("")
         stamp_lines.append(f"Approved by {approver} {approval_date}".strip())
         if email.strip():
             stamp_lines.append(email.strip())
 
+        stamp_height = len(stamp_lines) * line_gap + 12
         longest = max((len(line) for line in stamp_lines), default=30)
-        width = min(max(330, longest * font_size * 0.53 + 20), page_rect.width - 56)
-        height = len(stamp_lines) * line_gap + 12
-        x = max(28, (page_rect.width - width) / 2)
+        stamp_width = min(
+            max(330, longest * font_size * 0.53 + 20),
+            page_rect.width - 48,
+        )
+        if stamp_width < 250 or stamp_height > page_rect.height - 36:
+            raise ValueError("Stamp does not fit on the selected page.")
 
+        # Occupied text blocks are expanded slightly to preserve a visual margin.
         occupied = []
         for block in page.get_text("blocks"):
-            x0, y0, x1, y1 = block[:4]
-            if x1 > 0 and y1 > 0 and x0 < page_rect.width and y0 < page_rect.height:
-                occupied.append(pymupdf.Rect(x0, y0, x1, y1))
-        try:
-            for drawing in page.get_drawings():
-                drawing_rect = drawing.get("rect")
-                if drawing_rect and drawing_rect.width > 0 and drawing_rect.height > 0:
-                    occupied.append(pymupdf.Rect(drawing_rect))
-        except Exception:
-            pass
+            if len(block) < 5:
+                continue
+            x0, y0, x1, y1 = map(float, block[:4])
+            block_text = str(block[4]).strip()
+            if not block_text:
+                continue
+            rect = pymupdf.Rect(x0, y0, x1, y1)
+            if rect.intersects(page_rect):
+                occupied.append((rect, block_text))
 
-        center_y = (page_rect.height - height) / 2
-        candidates = [center_y]
-        step = max(12, line_gap)
-        max_offset = int(max(0, page_rect.height - height - 36))
-        for offset in range(step, max_offset + step, step):
-            candidates.extend([center_y - offset, center_y + offset])
+        margin_x, margin_y = 22, 18
+        x_min = margin_x
+        x_max = page_rect.width - stamp_width - margin_x
+        y_min = margin_y
+        y_max = page_rect.height - stamp_height - margin_y
+        if x_max < x_min or y_max < y_min:
+            raise ValueError("Stamp does not fit on the selected page.")
 
-        def is_clear(y):
-            candidate = pymupdf.Rect(x - 8, y - 6, x + width + 8, y + height + 6)
-            if candidate.x0 < 20 or candidate.x1 > page_rect.width - 20:
-                return False
-            if candidate.y0 < 18 or candidate.y1 > page_rect.height - 18:
-                return False
-            for item in occupied:
-                # Ignore thin page-border rules at the very edge.
-                if item.width > page_rect.width * 0.92 and (item.y0 < 6 or item.y1 > page_rect.height - 6):
+        # Search a coarse grid, then rank clear positions by closeness to the
+        # center of the page. Include extra candidates around text-block edges,
+        # which often correspond to the large blank section beneath invoice tables.
+        x_step = max(12, min(24, stamp_width / 14))
+        y_step = max(10, min(20, stamp_height / 3))
+        xs = {x_min, x_max, (x_min + x_max) / 2}
+        ys = {y_min, y_max, (y_min + y_max) / 2}
+        x = x_min
+        while x <= x_max:
+            xs.add(x)
+            x += x_step
+        y = y_min
+        while y <= y_max:
+            ys.add(y)
+            y += y_step
+
+        for rect, _ in occupied:
+            for candidate_x in (rect.x0 - stamp_width - 10, rect.x1 + 10):
+                if x_min <= candidate_x <= x_max:
+                    xs.add(candidate_x)
+            for candidate_y in (rect.y0 - stamp_height - 10, rect.y1 + 10):
+                if y_min <= candidate_y <= y_max:
+                    ys.add(candidate_y)
+
+        page_center = pymupdf.Point(page_rect.width / 2, page_rect.height / 2)
+        candidates = []
+        for candidate_x in xs:
+            for candidate_y in ys:
+                candidate = pymupdf.Rect(
+                    candidate_x - 5,
+                    candidate_y - 5,
+                    candidate_x + stamp_width + 5,
+                    candidate_y + stamp_height + 5,
+                )
+                if candidate.x0 < 12 or candidate.x1 > page_rect.width - 12:
                     continue
-                if candidate.intersects(item):
-                    return False
-            return True
+                if candidate.y0 < 12 or candidate.y1 > page_rect.height - 12:
+                    continue
+                if any(candidate.intersects(rect) for rect, _ in occupied):
+                    continue
 
-        y = next((candidate for candidate in candidates if is_clear(candidate)), None)
-        if y is None:
+                center = pymupdf.Point(
+                    candidate_x + stamp_width / 2,
+                    candidate_y + stamp_height / 2,
+                )
+                # Prefer the page center, while the grid and text-edge candidates
+                # allow the stamp to settle into the nearest large clear section.
+                distance = ((center.x - page_center.x) / max(page_rect.width, 1)) ** 2
+                distance += ((center.y - page_center.y) / max(page_rect.height, 1)) ** 2
+                candidates.append((distance, candidate_y, candidate_x))
+
+        if not candidates:
             raise ValueError("No clear space is available for the stamp on this page.")
 
-        panel = pymupdf.Rect(x - 8, y - 6, x + width + 8, y + height + 6)
-        page.draw_rect(panel, color=(0.82, 0.85, 0.87), fill=(1, 1, 1), width=0.7, overlay=True)
+        # Both placement choices honor the no-overlap rule. The default centers
+        # in the best available blank area; bottom placement prefers the lowest
+        # safe candidate if the user explicitly selects it.
+        if placement == "Bottom of summary page":
+            _, y, x = max(candidates, key=lambda item: (item[1], -item[0]))
+        else:
+            _, y, x = min(candidates, key=lambda item: item[0])
+
+        panel = pymupdf.Rect(x - 5, y - 5, x + stamp_width + 5, y + stamp_height + 5)
+        page.draw_rect(
+            panel,
+            color=(0.82, 0.85, 0.87),
+            fill=(1, 1, 1),
+            width=0.7,
+            overlay=True,
+        )
         for index, line in enumerate(stamp_lines):
             if line:
                 page.insert_text(
-                    (x + 4, y + index * line_gap + font_size),
+                    (x + 5, y + index * line_gap + font_size),
                     line,
                     fontname="helv",
                     fontsize=font_size,
@@ -736,6 +528,8 @@ def stamp_pdf(
         return document.tobytes(garbage=4, deflate=True)
     finally:
         document.close()
+
+
 
 st.markdown("""
 <style>
@@ -779,7 +573,7 @@ if uploaded_pdf is not None:
 
     has_gl_summary = any(_looks_like_summary(page_text) for _, page_text in candidate_pages)
     if not has_gl_summary:
-        st.warning("No pre-existing Juniper GL approval block was detected. GL codes are mapped from invoice summary labels; review the detected amounts and enter approval details if they are absent.")
+        st.warning("No pre-existing Juniper GL approval block was detected. Select the invoice totals page, then enter the GL codes, amounts, total, and approval details manually below.")
 
     page_labels = [f"Page {page_number + 1}" for page_number, _ in candidate_pages]
     selected_page_label = st.selectbox(
@@ -790,44 +584,29 @@ if uploaded_pdf is not None:
     selected_position = page_labels.index(selected_page_label)
     page_index, page_text = candidate_pages[selected_position]
     extracted = extract_from_page(page_text, selected_region)
-    # Prefer coordinate-preserving PDF text blocks for the selected page. This is
-    # essential for AU invoices where amounts can appear before labels in text order.
+    # The invoice summary labels and page coordinates are the source of truth.
+    # Do not use any GL codes or amounts printed in an existing approval stamp.
     try:
-        _pdf_doc = pymupdf.open(stream=pdf_content, filetype="pdf")
+        _coordinate_doc = pymupdf.open(stream=pdf_content, filetype="pdf")
         try:
-            _position_rows, _position_total = extract_region_amounts_from_page(_pdf_doc[page_index], selected_region)
+            _coordinate_rows, _coordinate_total = extract_region_amounts_from_page(
+                _coordinate_doc[page_index], selected_region
+            )
         finally:
-            _pdf_doc.close()
-        if len(_position_rows) == 2:
-            extracted["rows"] = _position_rows
-            extracted["total"] = _position_total
+            _coordinate_doc.close()
+        if len(_coordinate_rows) == 2:
+            extracted["rows"] = _coordinate_rows
+            extracted["total"] = _coordinate_total
+        else:
+            # Fail closed rather than silently carrying forward incorrect stamped rows.
+            extracted["rows"] = _coordinate_rows
+            extracted["total"] = _coordinate_total
     except Exception:
-        pass
-
-    # Preserve the reference script's extraction behavior. If the selected page
-    # is only partially parsed, retry that same page with OCR before showing fields.
-    if len(extracted.get("rows", [])) != 2:
-        try:
-            _doc = pymupdf.open(stream=pdf_content, filetype="pdf")
-            try:
-                _ocr_text = _ocr_page(_doc[page_index])
-            finally:
-                _doc.close()
-            _ocr_extracted = extract_from_page(_ocr_text, selected_region)
-            if len(_ocr_extracted.get("rows", [])) > len(extracted.get("rows", [])) or (
-                _ocr_extracted.get("total") is not None and extracted.get("total") is None
-            ):
-                extracted = _ocr_extracted
-                page_text = _ocr_text
-                st.info("The selected page was re-read with OCR because the initial extraction was incomplete. Verify every value.")
-        except Exception:
-            pass
+        extracted["rows"] = []
+        extracted["total"] = None
 
     st.subheader("Extracted information")
     st.caption(f"Selected summary page: {page_index + 1}")
-
-    if not extracted.get("rows"):
-        st.warning("No GL rows were extracted automatically. Enter the configured regional GL codes and amounts below.")
 
     rows = extracted["rows"] or [{"Juniper GL Code": "", "Amount": None}]
     editable_frame = pd.DataFrame(classify_rows(selected_region, rows))
@@ -843,36 +622,21 @@ if uploaded_pdf is not None:
         key="gl_editor",
     )
 
-    secret_approver_name, secret_approver_email = get_approval_defaults()
-    # Default approval date is the local date when extraction is generated.
-    # Allow the user to edit it if the actual approval date differs.
-    extraction_date = date.today().isoformat()
-
     first, second, third = st.columns(3)
     with first:
-        # Always derive the displayed total from the current GL rows when amounts
-        # are available, including after the user edits them.
-        amount_values = (
-            pd.to_numeric(edited_frame["Amount"], errors="coerce").dropna().tolist()
-            if "Amount" in edited_frame.columns else []
-        )
-        if amount_values:
-            default_total = round(sum(float(value) for value in amount_values), 2)
-        elif extracted["total"] is not None:
-            default_total = float(extracted["total"])
-        else:
-            default_total = 0.0
+        extracted_amounts = [
+            float(row["Amount"]) for row in extracted.get("rows", [])
+            if row.get("Amount") is not None
+        ]
+        default_total = round(sum(extracted_amounts), 2) if len(extracted_amounts) == 2 else 0.0
         invoice_total = st.number_input(
-            "Total amount (sum of GL amounts)", min_value=0.0, value=default_total, step=0.01, format="%.2f"
+            "Total amount (verify or enter manually)", min_value=0.0, value=default_total, step=0.01, format="%.2f"
         )
     with second:
-        approver_default = extracted["approver"] or secret_approver_name
-        approver_name = st.text_input("Approved by", value=approver_default, key="approved_by_input")
+        approver_name = st.text_input("Approved by", value=extracted["approver"])
     with third:
-        date_default = extraction_date
-        approval_date = st.text_input("Approval date (defaults to extraction date)", value=date_default, key="approval_date_input")
-    email_default = secret_approver_email
-    approver_email = st.text_input("Approver email", value=email_default, key="approver_email_input")
+        approval_date = st.text_input("Approval date", value=extracted["approval_date"])
+    approver_email = st.text_input("Approver email", value=extracted["email"])
 
     final_rows = []
     for _, row in edited_frame.iterrows():
