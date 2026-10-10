@@ -1,5 +1,5 @@
 """
-PDF Approval Stamp Tool — privacy-hardened Streamlit app.
+Juniper PDF Approval Stamp Tool — privacy-hardened Streamlit app.
 
 Privacy controls:
 - No invoice values or extracted personal/business data are written to logs.
@@ -47,7 +47,28 @@ try:
     _CONFIG = json.loads(base64.b64decode(_RULES_B64).decode("utf-8"))
 except Exception:
     # Safe fallback retains functionality if the encoded configuration is damaged.
-    _CONFIG = {"roles": {"IPLS": {"vat_suffix": "21", "net_suffix": "19"}, "AU": {"vat_suffix": "23", "net_suffix": "19"}, "NA and LATAM": {"vat_suffix": "21", "net_suffix": "19"}, "UK": {"vat_suffix": "21", "net_suffix": "19"}, "EMEA & APAC": {"vat_suffix": "21", "net_suffix": "19"}}, "aliases": {}}
+    _CONFIG = {
+        "roles": {
+            "IPLS": {"vat_suffix": "21", "net_suffix": "19"},
+            "AU": {"vat_suffix": "23", "net_suffix": "19"},
+            "NA and LATAM": {"vat_suffix": "21", "net_suffix": "19"},
+            "UK": {"vat_suffix": "21", "net_suffix": "19"},
+            "EMEA & APAC": {"vat_suffix": "21", "net_suffix": "19"},
+        },
+        "aliases": {},
+        "gl_codes": {
+            "IPLS": {"net": "3230624010501167019", "vat": "3230624010501167021"},
+            "AU": {"net": "3230624010501166019", "vat": "3230624010501166023"},
+            "NA and LATAM": {"net": "1010624010501115019", "vat": "1010624010501115021"},
+            "UK": {"net": "3230624010501167019", "vat": "3230624010501167021"},
+            "EMEA & APAC": {"net": "3230624010501167019", "vat": "3230624010501167021"},
+        },
+        "label_terms": {
+            "net": ["NET AMOUNT (USD)", "NET AMOUNT(USD)", "NET AMOUNT"],
+            "vat": ["TOTAL REGION VAT/TAXES (USD)", "TOTAL REGION VAT/TAXES", "TOTAL G.S.T", "TOTAL GST"],
+            "total": ["TOTAL AMOUNT (USD)", "TOTAL AMOUNT(USD)", "TOTAL AMOUNT", "INVOICE TOTAL"],
+        },
+    }
 REGION_RULES = _CONFIG["roles"]
 REGION_ALIASES = {key.upper(): value for key, value in _CONFIG.get("aliases", {}).items()}
 NET_LABEL = _CONFIG.get("net_label", "NCR CE on-site cost / Subtotal")
@@ -177,11 +198,11 @@ def extract_labeled_gl_rows(text: str, region: str) -> tuple[list[dict], Optiona
             break
 
     rows = []
+    region_codes = codes.get(region, {})
     if net_amount is not None:
-        rows.append({"Juniper GL Code": codes.get("net", ""), "Amount": net_amount})
+        rows.append({"Juniper GL Code": region_codes.get("net", ""), "Amount": net_amount})
     if vat_amount is not None:
-        vat_code = codes.get("au_gst", "") if region == "AU" else codes.get("vat", "")
-        rows.append({"Juniper GL Code": vat_code, "Amount": vat_amount})
+        rows.append({"Juniper GL Code": region_codes.get("vat", ""), "Amount": vat_amount})
     return rows, total_amount
 
 
@@ -353,16 +374,16 @@ def find_candidate_pages(pdf_bytes: bytes) -> tuple[list[tuple[int, str]], bool]
 
 
 def classify_rows(region: str, rows: list[dict]) -> list[dict]:
-    rules = REGION_RULES.get(region, {})
+    region_codes = _CONFIG.get("gl_codes", {}).get(region, {})
     classified = []
     for row in rows:
         code = str(row["Juniper GL Code"])
-        if code.endswith("19"):
+        if code == str(region_codes.get("net", "")):
             label = NET_LABEL
-        elif rules and code.endswith(rules["vat_suffix"]):
+        elif code == str(region_codes.get("vat", "")):
             label = VAT_LABEL
         else:
-            label = "Review — region/code suffix not mapped"
+            label = "Review — region/code not mapped"
         classified.append({**row, "Classification": label})
     return classified
 
@@ -403,10 +424,10 @@ def stamp_pdf(
         font_size = 9
         line_gap = 12
 
-        stamp_lines = [f'{"JUNIPER GL CODE":<30}{"AMOUNT":>14}']
+        stamp_lines = ["JUNIPER GL CODE                                      AMOUNT"]
         for row in rows:
-            stamp_lines.append(f'{str(row["Juniper GL Code"]):<30}${float(row["Amount"]):>13,.2f}')
-        stamp_lines.append(f'{"TOTAL AMOUNT":<30}${float(total):>13,.2f}')
+            stamp_lines.append(f'{row["Juniper GL Code"]}    ${float(row["Amount"]):,.2f}')
+        stamp_lines.append(f"TOTAL AMOUNT    ${float(total):,.2f}")
         stamp_lines.append("")
         stamp_lines.append(f"Approved by {approver} {approval_date}".strip())
         if email.strip():
@@ -453,7 +474,7 @@ st.markdown("""
 </style>
 <div class="hero">
 <h1>PDF Approval Stamp Tool</h1>
-<p>Extract details, validate approval totals, and stamp a separate copy of an invoice.</p>
+<p>Extract Juniper GL details, validate approval totals, and stamp a separate copy of an invoice.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -550,10 +571,10 @@ if uploaded_pdf is not None:
         st.success("Line amounts match the total. Review the stamp preview before processing.")
 
     st.subheader("Stamp preview")
-    preview_lines = [f'{"JUNIPER GL CODE":<30}{"AMOUNT":>14}']
+    preview_lines = ["JUNIPER GL CODE                         AMOUNT"]
     for row in final_rows:
-        preview_lines.append(f'{str(row["Juniper GL Code"]):<30}${float(row["Amount"]):>13,.2f}')
-    preview_lines.append(f'{"TOTAL AMOUNT":<30}${float(invoice_total):>13,.2f}')
+        preview_lines.append(f'{row["Juniper GL Code"]}    ${row["Amount"]:,.2f}')
+    preview_lines.append(f"TOTAL AMOUNT    ${invoice_total:,.2f}")
     preview_lines += ["", f"Approved by {approver_name} {approval_date}".strip(), approver_email]
     st.code("\n".join(preview_lines), language="text")
 
