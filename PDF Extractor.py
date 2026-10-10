@@ -166,47 +166,51 @@ def _india_parse_invoice(pdf_bytes: bytes) -> dict:
         r"\bINVOICE TOTAL\b[\s\S]{0,80}?([₹]?\s*[\d,]+\.\d{2})",
         r"\bTOTAL AMOUNT\b[\s\S]{0,80}?([₹]?\s*[\d,]+\.\d{2})",
     ])
-    # Prefer explicit tax amounts. When both CGST and SGST/UTGST are present,
-    # add them for the template's single Tax field; if only one is present,
-    # use that amount without halving or deriving a different value.
-    explicit_cgst = slab_cgst
-    explicit_sgst = slab_sgst
-    if explicit_cgst is None:
-        explicit_cgst = tax_amount_on_line(r"\bCGST\b")
-    if explicit_sgst is None:
-        explicit_sgst = tax_amount_on_line(r"\b(?:SGST|UTGST)\b")
-    explicit_igst = tax_amount_on_line(r"\bIGST\b") if has_igst else None
 
+    # Some invoices list several tax components/slabs below Subtotal. Capture
+    # the amount from each labeled tax line and add all components when there
+    # are more than two values, instead of relying only on total minus subtotal.
+    _tax_lines = text.splitlines()
+    _subtotal_line = next(
+        (i for i, line in enumerate(_tax_lines) if re.search(r"\bSubtotal\b", line, re.I)),
+        -1,
+    )
+    _total_line = next(
+        (
+            i for i, line in enumerate(_tax_lines)
+            if i > _subtotal_line and re.search(r"\b(?:INVOICE TOTAL|TOTAL AMOUNT|AMOUNT DUE)\b", line, re.I)
+        ),
+        len(_tax_lines),
+    )
+    _tax_scan_start = _subtotal_line + 1 if _subtotal_line >= 0 else 0
+    _tax_components = []
+    for _line in _tax_lines[_tax_scan_start:_total_line]:
+        if re.search(r"\b(?:IGST|CGST|SGST|UTGST)\b", _line, re.I):
+            _amount_matches = re.findall(r"\d[\d,]*\.\d{2}", _line)
+            if _amount_matches:
+                _component_amount = _india_amount(_amount_matches[-1])
+                if _component_amount is not None:
+                    _tax_components.append(_component_amount)
+    _multi_component_tax = (
+        round(sum(_tax_components), 2) if len(_tax_components) > 2 else None
+    )
+
+    # Summary PDFs may put the tax label, rate, and tax amount in separate
+    # text blocks. Derive total tax from invoice total minus subtotal, then
+    # use the template's single-tax-field convention for intra-state invoices.
     tax_total = round(total - net, 2) if total is not None and net is not None else None
-    if explicit_igst is not None:
-        igst = explicit_igst
-    else:
-        igst = tax_total if has_igst else None
-
-    cgst = explicit_cgst
-    sgst = explicit_sgst
-    if cgst is not None and sgst is not None:
-        tax_field = round(cgst + sgst, 2)
+    igst = tax_total if has_igst else None
+    cgst = round(tax_total / 2, 2) if has_cgst and has_sgst and tax_total is not None else None
+    sgst = cgst if has_cgst and has_sgst else None
+    tax_field = igst if has_igst else cgst
+    if slab_sgst is not None and slab_cgst is not None:
+        tax_field = round(slab_sgst + slab_cgst, 2)
+        cgst, sgst = slab_cgst, slab_sgst
         tax_type = "CGST/SGST"
-    elif cgst is not None:
-        tax_field = cgst
-        tax_type = "CGST"
-    elif sgst is not None:
-        tax_field = sgst
-        tax_type = "SGST/UTGST"
-    elif has_cgst and has_sgst and tax_total is not None:
-        # Fall back to the invoice tax total only when neither component amount
-        # was individually readable but both tax types are indicated.
-        tax_field = tax_total
-        cgst = round(tax_total / 2, 2)
-        sgst = round(tax_total - cgst, 2)
-        tax_type = "CGST/SGST"
-    elif has_igst:
-        tax_field = igst
-        tax_type = "IGST"
     else:
-        tax_field = None
-        tax_type = ""
+        tax_type = "IGST" if has_igst else ("CGST/SGST" if has_cgst and has_sgst else "")
+    if _multi_component_tax is not None:
+        tax_field = _multi_component_tax
     return {
         "invoice_number": inv_match.group(1).upper() if inv_match else "",
         "gstin": gstin,
@@ -943,9 +947,19 @@ if selected_region == "INDIA":
     # The callback runs before the next script execution, avoiding direct mutation
     # of a file_uploader widget after it has been instantiated.
     def _reset_india_pdf_uploads():
+        # Clear the selected PDFs, restore the default template table, and clear
+        # the previous extraction results without affecting other regions.
         st.session_state["india_pdf_uploader_version"] = (
             st.session_state.get("india_pdf_uploader_version", 0) + 1
         )
+        st.session_state["india_template_frame"] = _india_initial_table()
+        st.session_state["india_results"] = []
+        st.session_state["india_unmatched"] = []
+        st.session_state["india_duplicates"] = []
+        st.session_state["india_csv_name"] = (
+            f"NCR Invoice AP Upload file {datetime.now().strftime('%m.%d.%Y')}.csv"
+        )
+        st.session_state.pop("india_template_data_editor", None)
 
     _india_pdf_uploader_key = f"india_pdfs_{st.session_state.get('india_pdf_uploader_version', 0)}"
     india_pdfs = st.file_uploader(
@@ -1023,7 +1037,6 @@ if selected_region == "INDIA":
     if st.session_state.get("india_duplicates"):
         st.warning("Duplicate invoice PDFs were uploaded for: " + ", ".join(st.session_state["india_duplicates"]))
 
-    # Export the formatted Excel workbook; the CSV download is intentionally removed.
     _india_xlsx_buffer = BytesIO()
     with pd.ExcelWriter(_india_xlsx_buffer, engine="openpyxl") as _writer:
         india_edited_frame.to_excel(_writer, index=False, sheet_name="NCR")
@@ -1038,23 +1051,29 @@ if selected_region == "INDIA":
         )
         for _row in _ws.iter_rows():
             for _cell in _row:
-                _cell.alignment = Alignment(horizontal="center", vertical="center")
+                _cell.alignment = Alignment(
+                    horizontal="center",
+                    vertical="center",
+                    wrap_text=True,
+                )
                 _cell.border = _thin_border
                 if _cell.row == 1:
                     _cell.fill = _scarlet
                     _cell.font = _white_bold
-        # Fit each column to its longest header/data value, with a modest safety
-        # margin so the exported workbook opens without clipped cell contents.
+
+        # Fit each Excel column to its longest value/header. Long text columns
+        # are wrapped and capped at a readable width rather than stretching
+        # the workbook beyond the screen.
         for _column_cells in _ws.columns:
-            _max_length = max(
+            _column_letter = _column_cells[0].column_letter
+            _max_content_length = max(
                 (len(str(_cell.value)) if _cell.value is not None else 0)
                 for _cell in _column_cells
             )
-            _column_letter = _column_cells[0].column_letter
-            _ws.column_dimensions[_column_letter].width = max(10, _max_length + 2)
-        # Fit row heights to the default font and keep the header readable.
-        for _row_number in range(1, _ws.max_row + 1):
-            _ws.row_dimensions[_row_number].height = 20 if _row_number == 1 else 18
+            _ws.column_dimensions[_column_letter].width = min(
+                max(_max_content_length + 2, 12),
+                60,
+            )
         _ws.freeze_panes = "A2"
         _ws.auto_filter.ref = _ws.dimensions
 
@@ -1065,11 +1084,12 @@ if selected_region == "INDIA":
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
+
     st.button(
-        "Reset uploaded PDFs",
+        "Reset uploaded PDFs and table",
         on_click=_reset_india_pdf_uploads,
         use_container_width=True,
-        help="Clear the uploaded India invoice PDFs so you can select a new batch.",
+        help="Clear uploaded PDFs and reset the India table and extraction results to the original template.",
     )
     st.stop()
 
