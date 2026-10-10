@@ -454,6 +454,7 @@ def stamp_pdf(
     approval_date: str,
     email: str,
     placement: str,
+    region: str = "",
 ) -> bytes:
     """Place the approval stamp centered in a genuinely unoccupied area.
 
@@ -465,8 +466,13 @@ def stamp_pdf(
     try:
         page = document[page_index]
         page_rect = page.rect
-        font_size = 9
-        line_gap = 12
+        region_key = normalize_region(region)
+        compact_regional_stamp = region_key in ("NA and LATAM", "EMEA & APAC")
+        # These two invoice layouts have a specific blank area below the service
+        # description and to the left of NET TOTAL PAYABLE. Use a compact stamp
+        # there; all other regions retain their existing placement and sizing.
+        font_size = 6.5 if compact_regional_stamp else 9
+        line_gap = 7 if compact_regional_stamp else 12
         # Use a monospaced font so exactly three spaces separate the longest
         # GL-code column from the AMOUNT column and every amount starts aligned.
         gl_header = "JUNIPER GL CODE"
@@ -488,14 +494,15 @@ def stamp_pdf(
         if email.strip():
             stamp_lines.append(email.strip())
 
-        stamp_height = len(stamp_lines) * line_gap + 12
+        stamp_height = len(stamp_lines) * line_gap + (5 if compact_regional_stamp else 12)
         longest = max((len(line) for line in stamp_lines), default=30)
         # Courier glyphs are 0.6 em wide; allow a small horizontal safety margin.
         stamp_width = min(
-            max(330, longest * font_size * 0.60 + 20),
+            max(210 if compact_regional_stamp else 330,
+                longest * font_size * 0.60 + (12 if compact_regional_stamp else 20)),
             page_rect.width - 48,
         )
-        if stamp_width < 250 or stamp_height > page_rect.height - 36:
+        if stamp_width < (180 if compact_regional_stamp else 250) or stamp_height > page_rect.height - 36:
             raise ValueError("Stamp does not fit on the selected page.")
 
         # Occupied text blocks are expanded slightly to preserve a visual margin.
@@ -516,6 +523,27 @@ def stamp_pdf(
         x_max = page_rect.width - stamp_width - margin_x
         y_min = margin_y
         y_max = page_rect.height - stamp_height - margin_y
+
+        if compact_regional_stamp:
+            # Constrain the stamp to the requested blank section: below the
+            # service-description paragraph, left of NET TOTAL PAYABLE, and above
+            # the THIS INVOICE footer line. The exact bounds are read from page text.
+            service_bottom = None
+            payable_left = None
+            footer_top = None
+            for rect, block_text in occupied:
+                upper = re.sub(r"\s+", " ", block_text.upper())
+                if "THE SERVICES SHOWN ON THIS INVOICE" in upper:
+                    service_bottom = max(service_bottom or rect.y1, rect.y1)
+                if "NET TOTAL PAYABLE" in upper:
+                    payable_left = min(payable_left or rect.x0, rect.x0)
+                if "THIS INVOICE IS FOR HARDWARE MAINTENANCE SERVICES" in upper:
+                    footer_top = min(footer_top or rect.y0, rect.y0)
+            if service_bottom is not None and payable_left is not None and footer_top is not None:
+                x_min = max(18, page_rect.x0 + 18)
+                x_max = min(page_rect.x1 - stamp_width - 12, payable_left - stamp_width - 12)
+                y_min = max(18, service_bottom + 5)
+                y_max = min(page_rect.y1 - stamp_height - 12, footer_top - stamp_height - 5)
         if x_max < x_min or y_max < y_min:
             raise ValueError("Stamp does not fit on the selected page.")
 
@@ -759,6 +787,7 @@ if uploaded_pdf is not None:
                     datetime.now().strftime("%m.%d.%Y"),
                     approver_email,
                     stamp_placement,
+                    selected_region,
                 )
                 original_name = uploaded_pdf.name
                 base_name = original_name[:-4] if original_name.lower().endswith(".pdf") else original_name
