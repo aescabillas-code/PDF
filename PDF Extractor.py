@@ -149,11 +149,14 @@ def extract_region_amounts_from_page(page, region: str) -> tuple[list[dict], Opt
         for lx0, ly0, lx1, ly1 in boxes:
             for ax0, ay0, ax1, ay1, value in amounts:
                 if region in ("NA and LATAM", "EMEA & APAC"):
-                    # Amount must be below its own USD column header. Stop at the
-                    # next column's header by using a column-sized x window.
+                    # Amount must be below its own USD column header.
+                    # These invoice layouts can place the amount far to the right
+                    # of the heading, so do not cap the horizontal distance.
+                    # The nearest amount horizontally to each header is selected
+                    # when multiple values share the same summary row.
                     if ay0 <= ly1 + 8:
                         continue
-                    if ax0 < lx0 - 35 or ax0 > lx1 + 260:
+                    if ax0 < lx0 - 35:
                         continue
                     candidates.append((ay0 - ly1, abs(ax0 - lx0), value))
                 else:
