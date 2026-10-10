@@ -455,54 +455,41 @@ def stamp_pdf(
         page = document[page_index]
         page_rect = page.rect
         font_size = 9
-        # Compact two-column stamp: keep the amount header close to the GL
-        # heading, align all amounts on one vertical column, and preserve a
-        # deliberate gap between TOTAL AMOUNT and the approval details.
-        gl_x_offset = 0
-        amount_x_offset = 158
-        row_gap = 12
-        header_baseline = font_size
-        row_baselines = [
-            header_baseline + row_gap * (index + 1)
-            for index in range(len(rows))
-        ]
-        total_baseline = header_baseline + row_gap * (len(rows) + 1)
-        approval_baseline = total_baseline + 25
-        email_baseline = approval_baseline + row_gap
-        last_baseline = email_baseline if email.strip() else approval_baseline
-        stamp_height = last_baseline + 5
-        # Fit the layout to the content while leaving enough width for the
-        # 19-digit GL codes and the monetary column.
-        amount_texts = [f'${float(row["Amount"]):,.2f}' for row in rows]
-        amount_texts.append(f'${float(total):,.2f}')
-        amount_width = max((pymupdf.get_text_length(t, fontname="helv", fontsize=font_size) for t in amount_texts), default=65)
-        code_width = max((pymupdf.get_text_length(str(row["Juniper GL Code"]), fontname="helv", fontsize=font_size) for row in rows), default=130)
-        amount_x_offset = max(158, code_width + 14)
-        approval_text = f"Approved by {approver} {approval_date}".strip()
-        approval_width = pymupdf.get_text_length(approval_text, fontname="helv", fontsize=font_size)
-        email_width = pymupdf.get_text_length(email.strip(), fontname="helv", fontsize=font_size) if email.strip() else 0
-        stamp_width = max(amount_x_offset + amount_width, approval_width, email_width) + 8
-        stamp_width = min(max(245, stamp_width), page_rect.width - 48)
+        line_gap = 12
+        # Keep the stamp borderless and render the GL code and amount in
+        # separate columns. Amounts are right-aligned to the AMOUNT header.
+        stamp_lines = ["JUNIPER GL CODE", "AMOUNT"]
+        for row in rows:
+            stamp_lines.append(
+                f'{row["Juniper GL Code"]}    ${float(row["Amount"]):,.2f}'
+            )
+        stamp_lines.append(f"TOTAL AMOUNT    ${float(total):,.2f}")
+        stamp_lines.append("")
+        stamp_lines.append(f"Approved by {approver} {approval_date}".strip())
+        if email.strip():
+            stamp_lines.append(email.strip())
+
+        stamp_height = len(stamp_lines) * line_gap + 12
+        longest = max((len(line) for line in stamp_lines), default=30)
+        stamp_width = min(
+            max(330, longest * font_size * 0.53 + 20),
+            page_rect.width - 48,
+        )
         if stamp_width < 250 or stamp_height > page_rect.height - 36:
             raise ValueError("Stamp does not fit on the selected page.")
 
-        # Use individual text-line/span boxes rather than broad PDF text blocks.
-        # Some invoice PDFs group widely separated columns into one large block;
-        # treating that block as occupied falsely rejects otherwise blank space.
+        # Occupied text blocks are expanded slightly to preserve a visual margin.
         occupied = []
-        text_dict = page.get_text("dict")
-        for block in text_dict.get("blocks", []):
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    span_text = str(span.get("text", "")).strip()
-                    if not span_text:
-                        continue
-                    bbox = span.get("bbox")
-                    if not bbox or len(bbox) != 4:
-                        continue
-                    rect = pymupdf.Rect(*map(float, bbox))
-                    if rect.intersects(page_rect):
-                        occupied.append((rect, span_text))
+        for block in page.get_text("blocks"):
+            if len(block) < 5:
+                continue
+            x0, y0, x1, y1 = map(float, block[:4])
+            block_text = str(block[4]).strip()
+            if not block_text:
+                continue
+            rect = pymupdf.Rect(x0, y0, x1, y1)
+            if rect.intersects(page_rect):
+                occupied.append((rect, block_text))
 
         margin_x, margin_y = 22, 18
         x_min = margin_x
@@ -512,10 +499,11 @@ def stamp_pdf(
         if x_max < x_min or y_max < y_min:
             raise ValueError("Stamp does not fit on the selected page.")
 
-        # Search more densely so valid whitespace between invoice sections is
-        # not missed because the old coarse grid stepped over it.
-        x_step = 8
-        y_step = 6
+        # Search a coarse grid, then rank clear positions by closeness to the
+        # center of the page. Include extra candidates around text-block edges,
+        # which often correspond to the large blank section beneath invoice tables.
+        x_step = max(12, min(24, stamp_width / 14))
+        y_step = max(10, min(20, stamp_height / 3))
         xs = {x_min, x_max, (x_min + x_max) / 2}
         ys = {y_min, y_max, (y_min + y_max) / 2}
         x = x_min
@@ -527,12 +515,11 @@ def stamp_pdf(
             ys.add(y)
             y += y_step
 
-        # Include positions immediately above/below and beside detected text.
         for rect, _ in occupied:
-            for candidate_x in (rect.x0 - stamp_width - 4, rect.x1 + 4):
+            for candidate_x in (rect.x0 - stamp_width - 10, rect.x1 + 10):
                 if x_min <= candidate_x <= x_max:
                     xs.add(candidate_x)
-            for candidate_y in (rect.y0 - stamp_height - 4, rect.y1 + 4):
+            for candidate_y in (rect.y0 - stamp_height - 10, rect.y1 + 10):
                 if y_min <= candidate_y <= y_max:
                     ys.add(candidate_y)
 
@@ -574,50 +561,84 @@ def stamp_pdf(
         else:
             _, y, x = min(candidates, key=lambda item: item[0])
 
-        # No surrounding border or background box; only the stamp text is drawn.
-        text_x = x + 2
+        # Borderless stamp: do not draw a surrounding rectangle or filled panel.
+        # Use a fixed right edge for the AMOUNT heading and all monetary values.
+        left_x = x + 5
+        amount_right_x = x + stamp_width - 5
+        amount_header = "AMOUNT"
+        header_y = y + font_size
         page.insert_text(
-            (text_x + gl_x_offset, y + header_baseline),
+            (left_x, header_y),
             "JUNIPER GL CODE",
-            fontname="helv", fontsize=font_size, color=(0, 0, 0), overlay=True,
+            fontname="helv",
+            fontsize=font_size,
+            color=(0, 0, 0),
+            overlay=True,
+        )
+        amount_header_width = pymupdf.get_text_length(
+            amount_header, fontname="helv", fontsize=font_size
         )
         page.insert_text(
-            (text_x + amount_x_offset, y + header_baseline),
-            "AMOUNT",
-            fontname="helv", fontsize=font_size, color=(0, 0, 0), overlay=True,
+            (amount_right_x - amount_header_width, header_y),
+            amount_header,
+            fontname="helv",
+            fontsize=font_size,
+            color=(0, 0, 0),
+            overlay=True,
         )
-        for index, row in enumerate(rows):
-            baseline = y + row_baselines[index]
+
+        row_y = y + line_gap + font_size
+        for row in rows:
+            code_text = str(row["Juniper GL Code"])
+            amount_text = f'${float(row["Amount"]):,.2f}'
             page.insert_text(
-                (text_x + gl_x_offset, baseline),
-                str(row["Juniper GL Code"]),
-                fontname="helv", fontsize=font_size, color=(0, 0, 0), overlay=True,
+                (left_x, row_y),
+                code_text,
+                fontname="helv",
+                fontsize=font_size,
+                color=(0, 0, 0),
+                overlay=True,
+            )
+            amount_width = pymupdf.get_text_length(
+                amount_text, fontname="helv", fontsize=font_size
             )
             page.insert_text(
-                (text_x + amount_x_offset, baseline),
-                f'${float(row["Amount"]):,.2f}',
-                fontname="helv", fontsize=font_size, color=(0, 0, 0), overlay=True,
+                (amount_right_x - amount_width, row_y),
+                amount_text,
+                fontname="helv",
+                fontsize=font_size,
+                color=(0, 0, 0),
+                overlay=True,
             )
+            row_y += line_gap
+
+        total_text = f"TOTAL AMOUNT    ${float(total):,.2f}"
         page.insert_text(
-            (text_x + gl_x_offset, y + total_baseline),
-            "TOTAL AMOUNT",
-            fontname="helv", fontsize=font_size, color=(0, 0, 0), overlay=True,
+            (left_x, row_y),
+            total_text,
+            fontname="helv",
+            fontsize=font_size,
+            color=(0, 0, 0),
+            overlay=True,
         )
+        row_y += line_gap * 2
+        approval_text = f"Approved by {approver} {approval_date}".strip()
         page.insert_text(
-            (text_x + amount_x_offset, y + total_baseline),
-            f'${float(total):,.2f}',
-            fontname="helv", fontsize=font_size, color=(0, 0, 0), overlay=True,
-        )
-        page.insert_text(
-            (text_x + gl_x_offset, y + approval_baseline),
+            (left_x, row_y),
             approval_text,
-            fontname="helv", fontsize=font_size, color=(0, 0, 0), overlay=True,
+            fontname="helv",
+            fontsize=font_size,
+            color=(0, 0, 0),
+            overlay=True,
         )
         if email.strip():
             page.insert_text(
-                (text_x + gl_x_offset, y + email_baseline),
+                (left_x, row_y + line_gap),
                 email.strip(),
-                fontname="helv", fontsize=font_size, color=(0, 0, 0), overlay=True,
+                fontname="helv",
+                fontsize=font_size,
+                color=(0, 0, 0),
+                overlay=True,
             )
         return document.tobytes(garbage=4, deflate=True)
     finally:
@@ -664,9 +685,6 @@ if uploaded_pdf is not None:
     if not candidate_pages:
         st.error("No readable page text was detected. You can still use the tool only after selecting a readable PDF or installing/configuring OCR for scanned pages.")
         st.stop()
-
-    # A source invoice normally does not contain a Juniper GL approval block.
-    # Do not warn about its absence; regional summary extraction is handled below.
 
     # Auto-detect the most likely summary/approval page using the selected region's
     # labels and coordinate-matched values. Keep the dropdown available for correction.
@@ -743,7 +761,7 @@ if uploaded_pdf is not None:
     with second:
         approver_name = st.text_input("Approved by", value=extracted["approver"] or _secret_approver)
     with third:
-        # Automatically use the date the user is generating the approval details.
+        # Approval date reflects the user's local date when generating the stamp.
         approval_date = datetime.now().astimezone().strftime("%Y-%m-%d")
         st.text_input("Approval date (automatic)", value=approval_date, disabled=True)
     approver_email = st.text_input("Approver email", value=_secret_email or extracted["email"])
@@ -763,7 +781,7 @@ if uploaded_pdf is not None:
         st.success("Line amounts match the total. Review the stamp preview before processing.")
 
     st.subheader("Stamp preview")
-    preview_lines = ["JUNIPER GL CODE                         AMOUNT"]
+    preview_lines = ["JUNIPER GL CODE                                      AMOUNT"]
     for row in final_rows:
         preview_lines.append(f'{row["Juniper GL Code"]}    ${row["Amount"]:,.2f}')
     preview_lines.append(f"TOTAL AMOUNT    ${invoice_total:,.2f}")
@@ -771,8 +789,7 @@ if uploaded_pdf is not None:
     st.code("\n".join(preview_lines), language="text")
 
     if st.button("Create stamped PDF", type="primary", use_container_width=True):
-        # Refresh the approval date at generation time rather than reusing an
-        # invoice date or a date extracted from an earlier approval stamp.
+        # Refresh the date at the moment the user generates the stamped PDF.
         approval_date = datetime.now().astimezone().strftime("%Y-%m-%d")
         if not final_rows:
             st.error("Add at least one GL code and amount before stamping.")
