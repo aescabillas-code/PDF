@@ -166,20 +166,47 @@ def _india_parse_invoice(pdf_bytes: bytes) -> dict:
         r"\bINVOICE TOTAL\b[\s\S]{0,80}?([₹]?\s*[\d,]+\.\d{2})",
         r"\bTOTAL AMOUNT\b[\s\S]{0,80}?([₹]?\s*[\d,]+\.\d{2})",
     ])
-    # Summary PDFs may put the tax label, rate, and tax amount in separate
-    # text blocks. Derive total tax from invoice total minus subtotal, then
-    # use the template's single-tax-field convention for intra-state invoices.
+    # Prefer explicit tax amounts. When both CGST and SGST/UTGST are present,
+    # add them for the template's single Tax field; if only one is present,
+    # use that amount without halving or deriving a different value.
+    explicit_cgst = slab_cgst
+    explicit_sgst = slab_sgst
+    if explicit_cgst is None:
+        explicit_cgst = tax_amount_on_line(r"\bCGST\b")
+    if explicit_sgst is None:
+        explicit_sgst = tax_amount_on_line(r"\b(?:SGST|UTGST)\b")
+    explicit_igst = tax_amount_on_line(r"\bIGST\b") if has_igst else None
+
     tax_total = round(total - net, 2) if total is not None and net is not None else None
-    igst = tax_total if has_igst else None
-    cgst = round(tax_total / 2, 2) if has_cgst and has_sgst and tax_total is not None else None
-    sgst = cgst if has_cgst and has_sgst else None
-    tax_field = igst if has_igst else cgst
-    if slab_sgst is not None and slab_cgst is not None:
-        tax_field = round(slab_sgst + slab_cgst, 2)
-        cgst, sgst = slab_cgst, slab_sgst
-        tax_type = "CGST/SGST"
+    if explicit_igst is not None:
+        igst = explicit_igst
     else:
-        tax_type = "IGST" if has_igst else ("CGST/SGST" if has_cgst and has_sgst else "")
+        igst = tax_total if has_igst else None
+
+    cgst = explicit_cgst
+    sgst = explicit_sgst
+    if cgst is not None and sgst is not None:
+        tax_field = round(cgst + sgst, 2)
+        tax_type = "CGST/SGST"
+    elif cgst is not None:
+        tax_field = cgst
+        tax_type = "CGST"
+    elif sgst is not None:
+        tax_field = sgst
+        tax_type = "SGST/UTGST"
+    elif has_cgst and has_sgst and tax_total is not None:
+        # Fall back to the invoice tax total only when neither component amount
+        # was individually readable but both tax types are indicated.
+        tax_field = tax_total
+        cgst = round(tax_total / 2, 2)
+        sgst = round(tax_total - cgst, 2)
+        tax_type = "CGST/SGST"
+    elif has_igst:
+        tax_field = igst
+        tax_type = "IGST"
+    else:
+        tax_field = None
+        tax_type = ""
     return {
         "invoice_number": inv_match.group(1).upper() if inv_match else "",
         "gstin": gstin,
@@ -996,24 +1023,7 @@ if selected_region == "INDIA":
     if st.session_state.get("india_duplicates"):
         st.warning("Duplicate invoice PDFs were uploaded for: " + ", ".join(st.session_state["india_duplicates"]))
 
-    csv_bytes = india_edited_frame.to_csv(index=False, date_format="%m/%d/%Y").encode("utf-8-sig")
-    st.download_button(
-        "Download NCR Invoice AP Upload CSV",
-        data=csv_bytes,
-        file_name=st.session_state.get("india_csv_name", f"NCR Invoice AP Upload file {datetime.now().strftime('%m.%d.%Y')}.csv"),
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-    st.button(
-        "Reset uploaded PDFs",
-        on_click=_reset_india_pdf_uploads,
-        use_container_width=True,
-        help="Clear the uploaded India invoice PDFs so you can select a new batch.",
-    )
-
-    # CSV is plain text and cannot store cell borders, alignment, or header colors.
-    # Offer an additionally formatted XLSX while keeping the requested CSV download.
+    # Export the formatted Excel workbook; the CSV download is intentionally removed.
     _india_xlsx_buffer = BytesIO()
     with pd.ExcelWriter(_india_xlsx_buffer, engine="openpyxl") as _writer:
         india_edited_frame.to_excel(_writer, index=False, sheet_name="NCR")
@@ -1033,6 +1043,18 @@ if selected_region == "INDIA":
                 if _cell.row == 1:
                     _cell.fill = _scarlet
                     _cell.font = _white_bold
+        # Fit each column to its longest header/data value, with a modest safety
+        # margin so the exported workbook opens without clipped cell contents.
+        for _column_cells in _ws.columns:
+            _max_length = max(
+                (len(str(_cell.value)) if _cell.value is not None else 0)
+                for _cell in _column_cells
+            )
+            _column_letter = _column_cells[0].column_letter
+            _ws.column_dimensions[_column_letter].width = max(10, _max_length + 2)
+        # Fit row heights to the default font and keep the header readable.
+        for _row_number in range(1, _ws.max_row + 1):
+            _ws.row_dimensions[_row_number].height = 20 if _row_number == 1 else 18
         _ws.freeze_panes = "A2"
         _ws.auto_filter.ref = _ws.dimensions
 
@@ -1043,7 +1065,12 @@ if selected_region == "INDIA":
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
-    st.caption("Note: CSV files cannot preserve borders, alignment, or header colors. Use the formatted Excel download to retain the scarlet header, borders, and centered cells.")
+    st.button(
+        "Reset uploaded PDFs",
+        on_click=_reset_india_pdf_uploads,
+        use_container_width=True,
+        help="Clear the uploaded India invoice PDFs so you can select a new batch.",
+    )
     st.stop()
 
 
