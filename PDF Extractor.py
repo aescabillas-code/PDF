@@ -332,6 +332,57 @@ def find_candidate_pages(pdf_bytes: bytes) -> tuple[list[tuple[int, str]], bool]
         document.close()
 
 
+def auto_detect_summary_page(pdf_bytes: bytes, region: str, candidate_pages: list[tuple[int, str]]) -> tuple[list[tuple[int, str]], int]:
+    """Rank pages by region-specific summary labels and coordinate-extracted amounts."""
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        all_pages = [(i, page.get_text("text")) for i, page in enumerate(doc)]
+        # Include the existing candidates and any page that contains the regional
+        # labels, even when an unrelated page has an old approval block.
+        candidate_map = {i: text for i, text in candidate_pages}
+        for i, text in all_pages:
+            upper = re.sub(r"\s+", " ", text.upper())
+            if any(term in upper for term in (
+                "NET AMOUNT", "TOTAL REGION VAT/TAXES", "TOTAL G.S.T", "TOTAL GST", "SUBTOTAL", " VAT "
+            )):
+                candidate_map[i] = text
+
+        def score(item):
+            page_index, text = item
+            upper = re.sub(r"\s+", " ", text.upper())
+            if region == "AU":
+                net_terms, tax_terms = ("NET AMOUNT",), ("TOTAL G.S.T", "TOTAL GST")
+            elif region == "UK":
+                net_terms, tax_terms = ("SUBTOTAL",), ("VAT",)
+            else:
+                net_terms, tax_terms = ("NET AMOUNT(USD)", "NET AMOUNT (USD)"), (
+                    "TOTAL REGION VAT/TAXES(USD)", "TOTAL REGION VAT/TAXES (USD)"
+                )
+            score_value = 0
+            if any(term in upper for term in net_terms): score_value += 20
+            if any(term in upper for term in tax_terms): score_value += 20
+            if "TOTAL AMOUNT" in upper or "INVOICE TOTAL" in upper or "AMOUNT DUE" in upper: score_value += 3
+            if "JUNIPER GL CODE" in upper or "APPROVED BY" in upper: score_value += 1
+            try:
+                rows, total = extract_region_amounts_from_page(doc[page_index], region)
+                if len(rows) == 2 and total is not None:
+                    score_value += 100
+            except Exception:
+                pass
+            return score_value
+
+        options = list(candidate_map.items())
+        if not options:
+            return candidate_pages, 0
+        ranked = sorted(options, key=score, reverse=True)
+        best_index, best_text = ranked[0]
+        # Preserve a manageable dropdown, but make the best detected page its default.
+        ordered = [(best_index, best_text)] + [item for item in candidate_pages if item[0] != best_index]
+        return ordered, best_index
+    finally:
+        doc.close()
+
+
 def _region_gl_codes(region: str) -> dict:
     """Read full GL codes exclusively from Streamlit secrets."""
     region = normalize_region(region)
@@ -575,11 +626,20 @@ if uploaded_pdf is not None:
     if not has_gl_summary:
         st.warning("No pre-existing Juniper GL approval block was detected. Select the invoice totals page, then enter the GL codes, amounts, total, and approval details manually below.")
 
+    # Auto-detect the most likely summary/approval page using the selected region's
+    # labels and coordinate-matched values. Keep the dropdown available for correction.
+    try:
+        candidate_pages, auto_page_index = auto_detect_summary_page(
+            pdf_content, selected_region, candidate_pages
+        )
+    except Exception:
+        auto_page_index = candidate_pages[0][0]
     page_labels = [f"Page {page_number + 1}" for page_number, _ in candidate_pages]
+    st.caption(f"Automatically detected summary page: Page {auto_page_index + 1}. You can change it below if needed.")
     selected_page_label = st.selectbox(
         "Summary / approval page",
         page_labels,
-        index=len(page_labels) - 1,
+        index=0,
     )
     selected_position = page_labels.index(selected_page_label)
     page_index, page_text = candidate_pages[selected_position]
@@ -632,11 +692,17 @@ if uploaded_pdf is not None:
         invoice_total = st.number_input(
             "Total amount (verify or enter manually)", min_value=0.0, value=default_total, step=0.01, format="%.2f"
         )
+    try:
+        _approval_secrets = st.secrets.get("approval", {})
+        _secret_approver = str(_approval_secrets.get("approved_by", "")).strip()
+        _secret_email = str(_approval_secrets.get("email", "")).strip()
+    except Exception:
+        _secret_approver, _secret_email = "", ""
     with second:
-        approver_name = st.text_input("Approved by", value=extracted["approver"])
+        approver_name = st.text_input("Approved by", value=extracted["approver"] or _secret_approver)
     with third:
         approval_date = st.text_input("Approval date", value=extracted["approval_date"])
-    approver_email = st.text_input("Approver email", value=extracted["email"])
+    approver_email = st.text_input("Approver email", value=_secret_email or extracted["email"])
 
     final_rows = []
     for _, row in edited_frame.iterrows():
