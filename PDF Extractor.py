@@ -15,7 +15,6 @@ Run:
 from __future__ import annotations
 
 import re
-import json
 from typing import Optional
 from datetime import datetime
 
@@ -25,7 +24,6 @@ import pandas as pd
 import pytesseract
 from PIL import Image
 from io import BytesIO
-from pathlib import Path
 
 st.set_page_config(page_title="PDF Approval Stamp Tool", page_icon="📄", layout="wide", initial_sidebar_state="expanded")
 
@@ -172,13 +170,34 @@ def _india_parse_invoice(pdf_bytes: bytes) -> dict:
     }
 
 
-def _india_make_csv(template_bytes: bytes, pdf_uploads, quarter: str, year: int, fee_type: str, upload_month: str, upload_year: int):
-    """Fill blank AP upload template fields using invoice number + supplier GSTIN."""
-    try:
-        frame = pd.read_excel(BytesIO(template_bytes), sheet_name="NCR", dtype=object)
-    except Exception:
-        frame = pd.read_excel(BytesIO(template_bytes), dtype=object)
-    frame.columns = [_india_clean_text(c) for c in frame.columns]
+INDIA_TABLE_COLUMNS = [
+    "Juniper Entity Code", "NCR Vendor code", "GL Code ", "Amount- Duty/IGST",
+    "Curr", "Tax field", "Total (amount+tax)", "Dr-40/Cr-50", "Inv Date",
+    "Line Description", "Cost Center", "Project ID", "Invoice Number",
+    "Header Description to submit Weekly File", "Assignment Reference", "Tax Code",
+    "Billed From", "Billed To", "GSTIN", "HSN code ",
+]
+
+
+def _india_initial_table() -> pd.DataFrame:
+    """Create the NCR AP table directly in code; no Excel workbook is required."""
+    rows = [
+        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSDL10901", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G2", "DELHI", "MAHARASHTRA", "07AAACN7149L1Z4", "998719"],
+        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSGJ10375", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G2", "Gujarat", "MAHARASHTRA", "24AAACN7149L1Z8", "998719"],
+        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSHR10217", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G2", "Haryana", "MAHARASHTRA", "06AAACN7149L1Z6", "998719"],
+        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSKA13538", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G2", "Karnataka", "MAHARASHTRA", "29AAACN7149L1ZY", "998719"],
+        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSMH22167", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G1", "Maharashtra", "MAHARASHTRA", "27AAACN7149L1Z2", "998719"],
+        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSTN22344", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G2", "Tamil Nadu", "MAHARASHTRA", "33AAACN7149L1Z9", "998719"],
+        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSTS9775", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G2", "Telangana", "MAHARASHTRA", "36AAACN7149L1Z3", "998719"],
+        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSUP17039", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G2", "Uttar Pradesh", "MAHARASHTRA", "09AAACN7149L1Z0", "998719"],
+        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSMN1626", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G2", "Manipur", "MAHARASHTRA", "14AAACN7149L1Z9", "998719"],
+    ]
+    return pd.DataFrame(rows, columns=INDIA_TABLE_COLUMNS)
+
+
+def _india_make_csv(pdf_uploads, quarter: str, year: int, fee_type: str, upload_month: str, upload_year: int):
+    """Fill the in-app NCR AP table using invoice number + supplier GSTIN."""
+    frame = _india_initial_table()
     required = ["Invoice Number", "GSTIN", "Amount- Duty/IGST", "Tax field", "Total (amount+tax)", "Inv Date", "Line Description", "Header Description to submit Weekly File"]
     missing = [c for c in required if c not in frame.columns]
     if missing:
@@ -843,50 +862,41 @@ with st.sidebar:
 
 if selected_region == "INDIA":
     st.subheader("India — NCR AP Upload CSV")
-    st.caption("The NCR AP Excel template is provided with the app. Upload matching invoice PDFs; matching requires both invoice number and supplier GSTIN.")
+    st.caption("Upload matching invoice PDFs; matching requires both invoice number and supplier GSTIN.")
 
     qcol, ycol = st.columns(2)
     with qcol:
         selected_quarter = st.selectbox("Invoice quarter", ["Q1", "Q2", "Q3", "Q4"], index=3)
     with ycol:
-        selected_year = st.selectbox("Invoice year", list(range(datetime.now().year - 2, datetime.now().year + 4)), index=2)
+        _years = list(range(datetime.now().year - 2, datetime.now().year + 4))
+        selected_year = st.selectbox("Invoice year", _years, index=_years.index(datetime.now().year))
     fcol, mcol = st.columns(2)
     with fcol:
         selected_fee_type = st.selectbox("Weekly file description", ["Incident_fee", "TPM_fee"], index=0)
     with mcol:
-        selected_upload_month = st.selectbox("Weekly file month", ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"], index=datetime.now().month - 1)
+        selected_upload_month = st.selectbox(
+            "Weekly file month",
+            ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
+            index=datetime.now().month - 1,
+        )
 
-    # Load the supplied workbook on first render so the template table is always visible.
-    template_path = Path(__file__).resolve().with_name("NCR_Invoice_AP_Upload_Template.xlsx")
-    if not template_path.exists():
-        # Also support the original uploaded workbook filename when the app is run locally.
-        template_path = Path(__file__).resolve().with_name("NCR Invoice AP Upload file.xlsx")
+    # Always initialize the in-app table before rendering the PDF uploader.
+    if "india_template_frame" not in st.session_state or st.session_state["india_template_frame"] is None:
+        st.session_state["india_template_frame"] = _india_initial_table()
+        st.session_state["india_csv_name"] = f"NCR Invoice AP Upload file {datetime.now().strftime('%m.%d.%Y')}.csv"
+        st.session_state.setdefault("india_unmatched", [])
+        st.session_state.setdefault("india_duplicates", [])
+        st.session_state.setdefault("india_results", [])
 
-    if st.session_state.get("india_template_frame") is None:
-        try:
-            if not template_path.exists():
-                raise FileNotFoundError
-            _initial_template = pd.read_excel(template_path, sheet_name="NCR", dtype=object)
-            _initial_template.columns = [_india_clean_text(c) for c in _initial_template.columns]
-            st.session_state["india_template_frame"] = _initial_template
-            st.session_state["india_csv_name"] = f"NCR Invoice AP Upload file {datetime.now().strftime('%m.%d.%Y')}.csv"
-            st.session_state.setdefault("india_unmatched", [])
-            st.session_state.setdefault("india_duplicates", [])
-            st.session_state.setdefault("india_results", [])
-        except Exception:
-            st.error("The supplied NCR AP Excel template could not be loaded. Ensure the template workbook is included beside the app.")
-
-    st.caption("The table below is loaded from the supplied NCR AP Excel template and is displayed immediately. Upload PDFs and select Extract PDF data into template table to populate matching rows.")
-    india_pdfs = st.file_uploader("Upload matching invoice PDFs", type=["pdf"], accept_multiple_files=True, key="india_pdfs")
+    india_pdfs = st.file_uploader(
+        "Upload matching invoice PDFs", type=["pdf"], accept_multiple_files=True, key="india_pdfs"
+    )
 
     if india_pdfs and st.button("Extract PDF data into template table", type="primary", use_container_width=True):
         try:
-            if not template_path.exists():
-                raise FileNotFoundError
-            template_bytes = template_path.read_bytes()
             with st.spinner("Matching invoice numbers and supplier GSTINs..."):
                 india_frame, india_results, india_unmatched, india_duplicates = _india_make_csv(
-                    template_bytes, india_pdfs, selected_quarter, int(selected_year),
+                    india_pdfs, selected_quarter, int(selected_year),
                     selected_fee_type, selected_upload_month, int(selected_year)
                 )
             st.session_state["india_template_frame"] = india_frame
@@ -895,52 +905,51 @@ if selected_region == "INDIA":
             st.session_state["india_duplicates"] = india_duplicates
             st.session_state["india_csv_name"] = f"NCR Invoice AP Upload file {datetime.now().strftime('%m.%d.%Y')}.csv"
             st.session_state.pop("india_template_data_editor", None)
-            st.success(f"Extracted data into the template table. {len(india_results)} invoice record(s) matched.")
+            st.success(f"Extracted data into the table. {len(india_results)} invoice record(s) matched.")
         except Exception:
-            st.error("The supplied Excel template or invoice PDFs could not be processed. Check that the template workbook is included and the PDFs are valid.")
+            st.error("The invoice PDFs could not be processed. Check that the PDFs are valid and try again.")
 
-    if st.session_state.get("india_template_frame") is not None:
-        st.subheader("Review and edit template data")
-        st.caption("The table uses the supplied Excel template's original columns and rows. Review the extracted values before downloading.")
-        india_edited_frame = st.data_editor(
-            st.session_state["india_template_frame"],
-            num_rows="dynamic",
-            use_container_width=True,
-            key="india_template_data_editor",
+    st.subheader("Review and edit table")
+    st.caption("The table is built into the app and is displayed immediately below the PDF upload. Upload PDFs and select Extract PDF data into template table to populate matching rows.")
+    india_edited_frame = st.data_editor(
+        st.session_state["india_template_frame"],
+        num_rows="dynamic",
+        use_container_width=True,
+        key="india_template_data_editor",
+    )
+    _india_totals_frame = india_edited_frame.copy()
+    _india_total_columns = [
+        column for column in ["Amount- Duty/IGST", "Tax field", "Total (amount+tax)"]
+        if column in _india_totals_frame.columns
+    ]
+    if _india_total_columns:
+        _india_totals_rows = []
+        for _column in _india_total_columns:
+            _numeric_values = pd.to_numeric(_india_totals_frame[_column], errors="coerce").dropna()
+            _india_totals_rows.append({
+                "Amount column": _column,
+                "Total amount": round(float(_numeric_values.sum()), 2),
+            })
+        st.subheader("Total Amount Summary")
+        _india_totals_display = pd.DataFrame(_india_totals_rows)
+        _india_totals_display["Total amount"] = _india_totals_display["Total amount"].map(
+            lambda value: f"{value:,.2f}"
         )
-        _india_totals_frame = india_edited_frame.copy()
-        _india_total_columns = [
-            column for column in ["Amount- Duty/IGST", "Tax field", "Total (amount+tax)"]
-            if column in _india_totals_frame.columns
-        ]
-        if _india_total_columns:
-            _india_totals_rows = []
-            for _column in _india_total_columns:
-                _numeric_values = pd.to_numeric(_india_totals_frame[_column], errors="coerce").dropna()
-                _india_totals_rows.append({
-                    "Amount column": _column,
-                    "Total amount": round(float(_numeric_values.sum()), 2),
-                })
-            st.subheader("Total Amount Summary")
-            _india_totals_display = pd.DataFrame(_india_totals_rows)
-            _india_totals_display["Total amount"] = _india_totals_display["Total amount"].map(
-                lambda value: f"{value:,.2f}"
-            )
-            st.dataframe(_india_totals_display, use_container_width=True, hide_index=True)
+        st.dataframe(_india_totals_display, use_container_width=True, hide_index=True)
 
-        if st.session_state.get("india_unmatched"):
-            st.warning("Some template rows did not match both invoice number and supplier GSTIN. Those rows were not filled: " + ", ".join(st.session_state["india_unmatched"]))
-        if st.session_state.get("india_duplicates"):
-            st.warning("Duplicate invoice PDFs were uploaded for: " + ", ".join(st.session_state["india_duplicates"]))
+    if st.session_state.get("india_unmatched"):
+        st.warning("Some table rows did not match both invoice number and supplier GSTIN. Those rows were not filled: " + ", ".join(st.session_state["india_unmatched"]))
+    if st.session_state.get("india_duplicates"):
+        st.warning("Duplicate invoice PDFs were uploaded for: " + ", ".join(st.session_state["india_duplicates"]))
 
-        csv_bytes = india_edited_frame.to_csv(index=False, date_format="%m/%d/%Y").encode("utf-8-sig")
-        st.download_button(
-            "Download NCR Invoice AP Upload CSV",
-            data=csv_bytes,
-            file_name=st.session_state.get("india_csv_name", f"NCR Invoice AP Upload file {datetime.now().strftime('%m.%d.%Y')}.csv"),
-            mime="text/csv",
-            use_container_width=True,
-        )
+    csv_bytes = india_edited_frame.to_csv(index=False, date_format="%m/%d/%Y").encode("utf-8-sig")
+    st.download_button(
+        "Download NCR Invoice AP Upload CSV",
+        data=csv_bytes,
+        file_name=st.session_state.get("india_csv_name", f"NCR Invoice AP Upload file {datetime.now().strftime('%m.%d.%Y')}.csv"),
+        mime="text/csv",
+        use_container_width=True,
+    )
     st.stop()
 
 
