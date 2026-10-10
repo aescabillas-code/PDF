@@ -960,8 +960,43 @@ def _sow_scope_label(sentence):
     return cleaned[:180] + ('…' if len(cleaned) > 180 else '')
 
 
-# Navigation controls remain in the lower-left sidebar. The active tool determines
-# which page header is rendered, so the PDF Approval Stamp Tool header is absent in SOW mode.
+# Navigation controls are fixed at the bottom-left of the sidebar. The active tool
+# determines which page header is rendered, so the PDF Approval Stamp Tool header
+# is absent in SOW mode. Only the navigation placement and button styling are changed.
+st.markdown("""
+<style>
+/* Anchor the two tool buttons at the lower-left of the app sidebar. */
+section[data-testid="stSidebar"] { overflow: visible !important; }
+div.st-key-nav_pdf_stamp,
+div.st-key-nav_vendor_sow {
+    position: fixed !important;
+    left: 1rem !important;
+    width: calc(18rem - 2rem) !important;
+    z-index: 1001 !important;
+    margin: 0 !important;
+}
+div.st-key-nav_pdf_stamp { bottom: 4.35rem !important; }
+div.st-key-nav_vendor_sow { bottom: 1rem !important; }
+div.st-key-nav_pdf_stamp button,
+div.st-key-nav_vendor_sow button {
+    width: 100% !important;
+    min-height: 2.65rem !important;
+    background: #008A69 !important;
+    color: #FFFFFF !important;
+    border: 1px solid #008A69 !important;
+    border-radius: 9px !important;
+    font-weight: 650 !important;
+}
+div.st-key-nav_pdf_stamp button:hover,
+div.st-key-nav_vendor_sow button:hover {
+    background: #006B4F !important;
+    color: #FFFFFF !important;
+    border-color: #006B4F !important;
+}
+div.st-key-nav_pdf_stamp button p,
+div.st-key-nav_vendor_sow button p { color: #FFFFFF !important; }
+</style>
+""", unsafe_allow_html=True)
 if 'active_tool' not in st.session_state:
     st.session_state['active_tool'] = 'PDF Approval Stamp Tool'
 with st.sidebar:
