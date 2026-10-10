@@ -124,101 +124,41 @@ def _india_parse_invoice(pdf_bytes: bytes) -> dict:
         r"\bSubtotal\b\s*(?:\[INR\])?\s*([₹]?\s*[\d,]+\.\d{2})",
         r"\bSubtotal\b[\s\S]{0,100}?([₹]?\s*[\d,]+\.\d{2})",
     ])
-    def tax_amount_on_line(label_pattern):
-        for line in text.splitlines():
-            if re.search(label_pattern, line, re.I):
-                matches = re.findall(r"\d[\d,]*\.\d{2}", line)
-                # Tax lines often contain a rate (e.g. 18.00) before the tax value.
-                if matches:
-                    return _india_amount(matches[-1])
-        # Some PDFs split the tax label, rate, and amount across adjacent lines.
-        lines = text.splitlines()
-        for i, line in enumerate(lines):
-            if re.search(label_pattern, line, re.I):
-                chunk = " ".join(lines[i:i + 3])
-                matches = re.findall(r"\d[\d,]*\.\d{2}", chunk)
-                if matches:
-                    return _india_amount(matches[-1])
-        return None
-
-    has_igst = bool(re.search(r"\bIGST\b", text, re.I))
-    has_cgst = bool(re.search(r"\bCGST\b", text, re.I))
-    has_sgst = bool(re.search(r"\b(?:SGST|UTGST)\b", text, re.I))
-
-    # When both slab-specific tax lines are present, use their actual amounts
-    # and add them together instead of deriving tax by splitting the total.
-    def slab_amount(code):
-        lines = text.splitlines()
-        for i, line in enumerate(lines):
-            if re.search(re.escape(code), line, re.I):
-                matches = re.findall(r"\d[\d,]*\.\d{2}", line)
-                if matches:
-                    return _india_amount(matches[-1])
-                chunk = " ".join(lines[i:i + 3])
-                matches = re.findall(r"\d[\d,]*\.\d{2}", chunk)
-                if matches:
-                    return _india_amount(matches[-1])
-        return None
-
-    slab_sgst = slab_amount("SGST-INV-SLAB4")
-    slab_cgst = slab_amount("CGST-INV-SLAB4")
     total = value_after([
         r"\bINVOICE TOTAL\b[\s\S]{0,80}?([₹]?\s*[\d,]+\.\d{2})",
         r"\bTOTAL AMOUNT\b[\s\S]{0,80}?([₹]?\s*[\d,]+\.\d{2})",
+        r"\bAMOUNT DUE\b[\s\S]{0,80}?([₹]?\s*[\d,]+\.\d{2})",
     ])
 
-    # Some invoices list several tax components/slabs below Subtotal. Capture
-    # the amount from each labeled tax line and add all components when there
-    # are more than two values, instead of relying only on total minus subtotal.
-    _tax_lines = text.splitlines()
-    _subtotal_line = next(
-        (i for i, line in enumerate(_tax_lines) if re.search(r"\bSubtotal\b", line, re.I)),
-        -1,
-    )
-    _total_line = next(
-        (
-            i for i, line in enumerate(_tax_lines)
-            if i > _subtotal_line and re.search(r"\b(?:INVOICE TOTAL|TOTAL AMOUNT|AMOUNT DUE)\b", line, re.I)
-        ),
-        len(_tax_lines),
-    )
-    _tax_scan_start = _subtotal_line + 1 if _subtotal_line >= 0 else 0
+    # Collect every monetary amount after Subtotal and before the invoice total.
+    # PDF text extraction can separate tax labels and values into different lines,
+    # so scan the flattened text segment instead of depending on CGST/SGST labels.
+    _subtotal_match = re.search(r"\bSubtotal\b", flat, re.I)
+    _total_match = re.search(r"\b(?:INVOICE TOTAL|TOTAL AMOUNT|AMOUNT DUE)\b", flat, re.I)
     _tax_components = []
-    for _line in _tax_lines[_tax_scan_start:_total_line]:
-        if re.search(r"\b(?:IGST|CGST|SGST|UTGST)\b", _line, re.I):
-            _amount_matches = re.findall(r"\d[\d,]*\.\d{2}", _line)
-            if _amount_matches:
-                _component_amount = _india_amount(_amount_matches[-1])
-                if _component_amount is not None:
-                    _tax_components.append(_component_amount)
-    _multi_component_tax = (
-        round(sum(_tax_components), 2) if len(_tax_components) > 2 else None
-    )
+    if _subtotal_match and _total_match and _total_match.start() > _subtotal_match.end():
+        _tax_section = flat[_subtotal_match.end():_total_match.start()]
+        # Drop the subtotal value itself; the section starts immediately after
+        # the word Subtotal and may contain its amount before the tax amounts.
+        _amount_matches = re.findall(r"\d[\d,]*\.\d{2}", _tax_section)
+        if _amount_matches:
+            # First amount after the label is the subtotal. Remaining amounts
+            # are tax components; each is included in the tax sum.
+            _amount_matches = _amount_matches[1:]
+        for _amount_text in _amount_matches:
+            _component_amount = _india_amount(_amount_text)
+            if _component_amount is not None:
+                _tax_components.append(_component_amount)
 
-    # Summary PDFs may put the tax label, rate, and tax amount in separate
-    # text blocks. Derive total tax from invoice total minus subtotal, then
-    # use the template's single-tax-field convention for intra-state invoices.
-    tax_total = round(total - net, 2) if total is not None and net is not None else None
-    igst = tax_total if has_igst else None
-    cgst = round(tax_total / 2, 2) if has_cgst and has_sgst and tax_total is not None else None
-    sgst = cgst if has_cgst and has_sgst else None
-    tax_field = igst if has_igst else cgst
-    if slab_sgst is not None and slab_cgst is not None:
-        tax_field = round(slab_sgst + slab_cgst, 2)
-        cgst, sgst = slab_cgst, slab_sgst
-        tax_type = "CGST/SGST"
-    else:
-        tax_type = "IGST" if has_igst else ("CGST/SGST" if has_cgst and has_sgst else "")
-    if _multi_component_tax is not None:
-        tax_field = _multi_component_tax
+    _tax_total_from_lines = round(sum(_tax_components), 2) if _tax_components else None
+    _fallback_tax_total = round(total - net, 2) if total is not None and net is not None else None
+    tax_field = _tax_total_from_lines if _tax_total_from_lines is not None else _fallback_tax_total
+    tax_type = "IGST" if re.search(r"\bIGST\b", text, re.I) else ("TAX" if tax_field is not None else "")
     return {
         "invoice_number": inv_match.group(1).upper() if inv_match else "",
         "gstin": gstin,
         "invoice_date": invoice_date,
         "net": net,
-        "igst": igst,
-        "cgst": cgst,
-        "sgst": sgst,
         "tax_field": tax_field,
         "tax_type": tax_type,
         "invoice_total": total,
@@ -1076,6 +1016,21 @@ if selected_region == "INDIA":
             )
         _ws.freeze_panes = "A2"
         _ws.auto_filter.ref = _ws.dimensions
+
+    st.markdown("""
+    <style>
+    div[data-testid="stDownloadButton"] button {
+        background-color: #008A69 !important;
+        color: #FFFFFF !important;
+        border: 1px solid #008A69 !important;
+    }
+    div[data-testid="stDownloadButton"] button:hover {
+        background-color: #006B4F !important;
+        color: #FFFFFF !important;
+        border-color: #006B4F !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
     st.download_button(
         "Download formatted Excel table",
