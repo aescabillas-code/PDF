@@ -444,52 +444,57 @@ def stamp_pdf(
     email: str,
     placement: str,
 ) -> bytes:
-    """Place the approval stamp centered in a genuinely unoccupied area.
+    """Place a compact, borderless approval stamp in a clear area.
 
-    The search uses page text block coordinates so it works across invoice layouts
-    where the summary may be at the top, bottom, or side of the page. If no safe
-    rectangle can fit the complete stamp, fail rather than cover invoice content.
+    The GL code and amount columns are aligned independently. No surrounding
+    rectangle is drawn, and rows use consistent tight spacing without blank
+    spacer lines. The stamp is placed only where detected page text will not
+    be covered.
     """
     document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     try:
         page = document[page_index]
         page_rect = page.rect
         font_size = 9
-        line_gap = 12
-        # Keep the stamp borderless and render the GL code and amount in
-        # separate columns. Amounts are right-aligned to the AMOUNT header.
-        stamp_lines = ["JUNIPER GL CODE", "AMOUNT"]
-        for row in rows:
-            stamp_lines.append(
-                f'{row["Juniper GL Code"]}    ${float(row["Amount"]):,.2f}'
-            )
-        stamp_lines.append(f"TOTAL AMOUNT    ${float(total):,.2f}")
-        stamp_lines.append("")
-        stamp_lines.append(f"Approved by {approver} {approval_date}".strip())
-        if email.strip():
-            stamp_lines.append(email.strip())
+        line_gap = 10.5
+        left_pad = 5
+        amount_col_offset = 150
 
-        stamp_height = len(stamp_lines) * line_gap + 12
-        longest = max((len(line) for line in stamp_lines), default=30)
-        stamp_width = min(
-            max(330, longest * font_size * 0.53 + 20),
-            page_rect.width - 48,
+        # Keep every row on a single compact line; align amounts in one column.
+        stamp_lines = [("JUNIPER GL CODE", "AMOUNT")]
+        for row in rows:
+            stamp_lines.append((
+                str(row["Juniper GL Code"]),
+                f'${float(row["Amount"]):,.2f}',
+            ))
+        stamp_lines.append(("TOTAL AMOUNT", f'${float(total):,.2f}'))
+        stamp_lines.append((f"Approved by {approver} {approval_date}".strip(), ""))
+        if email.strip():
+            stamp_lines.append((email.strip(), ""))
+
+        longest_left = max((len(left) for left, _ in stamp_lines), default=20)
+        longest_amount = max((len(right) for _, right in stamp_lines), default=6)
+        # Compact but with enough separation between the GL code and amount columns.
+        text_width = max(
+            longest_left * font_size * 0.52 + left_pad * 2,
+            amount_col_offset + longest_amount * font_size * 0.52 + left_pad,
+            260,
         )
-        if stamp_width < 250 or stamp_height > page_rect.height - 36:
+        stamp_width = min(text_width, page_rect.width - 48)
+        stamp_height = len(stamp_lines) * line_gap + 4
+        if stamp_width < 220 or stamp_height > page_rect.height - 36:
             raise ValueError("Stamp does not fit on the selected page.")
 
-        # Occupied text blocks are expanded slightly to preserve a visual margin.
         occupied = []
         for block in page.get_text("blocks"):
             if len(block) < 5:
                 continue
             x0, y0, x1, y1 = map(float, block[:4])
-            block_text = str(block[4]).strip()
-            if not block_text:
+            if not str(block[4]).strip():
                 continue
             rect = pymupdf.Rect(x0, y0, x1, y1)
             if rect.intersects(page_rect):
-                occupied.append((rect, block_text))
+                occupied.append((rect, str(block[4]).strip()))
 
         margin_x, margin_y = 22, 18
         x_min = margin_x
@@ -499,9 +504,6 @@ def stamp_pdf(
         if x_max < x_min or y_max < y_min:
             raise ValueError("Stamp does not fit on the selected page.")
 
-        # Search a coarse grid, then rank clear positions by closeness to the
-        # center of the page. Include extra candidates around text-block edges,
-        # which often correspond to the large blank section beneath invoice tables.
         x_step = max(12, min(24, stamp_width / 14))
         y_step = max(10, min(20, stamp_height / 3))
         xs = {x_min, x_max, (x_min + x_max) / 2}
@@ -528,10 +530,10 @@ def stamp_pdf(
         for candidate_x in xs:
             for candidate_y in ys:
                 candidate = pymupdf.Rect(
-                    candidate_x - 5,
-                    candidate_y - 5,
-                    candidate_x + stamp_width + 5,
-                    candidate_y + stamp_height + 5,
+                    candidate_x - 3,
+                    candidate_y - 3,
+                    candidate_x + stamp_width + 3,
+                    candidate_y + stamp_height + 3,
                 )
                 if candidate.x0 < 12 or candidate.x1 > page_rect.width - 12:
                     continue
@@ -544,8 +546,6 @@ def stamp_pdf(
                     candidate_x + stamp_width / 2,
                     candidate_y + stamp_height / 2,
                 )
-                # Prefer the page center, while the grid and text-edge candidates
-                # allow the stamp to settle into the nearest large clear section.
                 distance = ((center.x - page_center.x) / max(page_rect.width, 1)) ** 2
                 distance += ((center.y - page_center.y) / max(page_rect.height, 1)) ** 2
                 candidates.append((distance, candidate_y, candidate_x))
@@ -553,93 +553,32 @@ def stamp_pdf(
         if not candidates:
             raise ValueError("No clear space is available for the stamp on this page.")
 
-        # Both placement choices honor the no-overlap rule. The default centers
-        # in the best available blank area; bottom placement prefers the lowest
-        # safe candidate if the user explicitly selects it.
         if placement == "Bottom of summary page":
             _, y, x = max(candidates, key=lambda item: (item[1], -item[0]))
         else:
             _, y, x = min(candidates, key=lambda item: item[0])
 
-        # Borderless stamp: do not draw a surrounding rectangle or filled panel.
-        # Use a fixed right edge for the AMOUNT heading and all monetary values.
-        left_x = x + 5
-        amount_right_x = x + stamp_width - 5
-        amount_header = "AMOUNT"
-        header_y = y + font_size
-        page.insert_text(
-            (left_x, header_y),
-            "JUNIPER GL CODE",
-            fontname="helv",
-            fontsize=font_size,
-            color=(0, 0, 0),
-            overlay=True,
-        )
-        amount_header_width = pymupdf.get_text_length(
-            amount_header, fontname="helv", fontsize=font_size
-        )
-        page.insert_text(
-            (amount_right_x - amount_header_width, header_y),
-            amount_header,
-            fontname="helv",
-            fontsize=font_size,
-            color=(0, 0, 0),
-            overlay=True,
-        )
-
-        row_y = y + line_gap + font_size
-        for row in rows:
-            code_text = str(row["Juniper GL Code"])
-            amount_text = f'${float(row["Amount"]):,.2f}'
-            page.insert_text(
-                (left_x, row_y),
-                code_text,
-                fontname="helv",
-                fontsize=font_size,
-                color=(0, 0, 0),
-                overlay=True,
-            )
-            amount_width = pymupdf.get_text_length(
-                amount_text, fontname="helv", fontsize=font_size
-            )
-            page.insert_text(
-                (amount_right_x - amount_width, row_y),
-                amount_text,
-                fontname="helv",
-                fontsize=font_size,
-                color=(0, 0, 0),
-                overlay=True,
-            )
-            row_y += line_gap
-
-        total_text = f"TOTAL AMOUNT    ${float(total):,.2f}"
-        page.insert_text(
-            (left_x, row_y),
-            total_text,
-            fontname="helv",
-            fontsize=font_size,
-            color=(0, 0, 0),
-            overlay=True,
-        )
-        row_y += line_gap * 2
-        approval_text = f"Approved by {approver} {approval_date}".strip()
-        page.insert_text(
-            (left_x, row_y),
-            approval_text,
-            fontname="helv",
-            fontsize=font_size,
-            color=(0, 0, 0),
-            overlay=True,
-        )
-        if email.strip():
-            page.insert_text(
-                (left_x, row_y + line_gap),
-                email.strip(),
-                fontname="helv",
-                fontsize=font_size,
-                color=(0, 0, 0),
-                overlay=True,
-            )
+        # Intentionally do not draw a border or background panel around the stamp.
+        for index, (left_text, amount_text) in enumerate(stamp_lines):
+            baseline_y = y + index * line_gap + font_size
+            if left_text:
+                page.insert_text(
+                    (x + left_pad, baseline_y),
+                    left_text,
+                    fontname="helv",
+                    fontsize=font_size,
+                    color=(0, 0, 0),
+                    overlay=True,
+                )
+            if amount_text:
+                page.insert_text(
+                    (x + amount_col_offset, baseline_y),
+                    amount_text,
+                    fontname="helv",
+                    fontsize=font_size,
+                    color=(0, 0, 0),
+                    overlay=True,
+                )
         return document.tobytes(garbage=4, deflate=True)
     finally:
         document.close()
