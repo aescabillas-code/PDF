@@ -26,6 +26,7 @@ import pandas as pd
 import pytesseract
 from PIL import Image
 from io import BytesIO
+from pathlib import Path
 
 st.set_page_config(page_title="PDF Approval Stamp Tool", page_icon="📄", layout="wide", initial_sidebar_state="expanded")
 
@@ -37,6 +38,11 @@ header[data-testid="stHeader"] {visibility: hidden !important; height: 0 !import
 [data-testid="stToolbar"] {visibility: hidden !important; height: 0 !important;}
 [data-testid="stDecoration"] {visibility: hidden !important;}
 [data-testid="stStatusWidget"] {visibility: hidden !important;}
+/* Keep the region-selection sidebar fixed and prevent users from collapsing it. */
+[data-testid="stSidebarCollapseButton"],
+[data-testid="collapsedControl"],
+button[kind="header"] {display: none !important; visibility: hidden !important;}
+section[data-testid="stSidebar"] {transform: none !important; min-width: 18rem !important; visibility: visible !important;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -167,14 +173,14 @@ def _india_parse_invoice(pdf_bytes: bytes) -> dict:
     }
 
 
-def _india_make_csv(template_bytes: bytes, pdf_uploads, quarter: str, year: int):
+def _india_make_csv(template_bytes: bytes, pdf_uploads, quarter: str, year: int, fee_type: str, upload_month: str, upload_year: int):
     """Fill blank AP upload template fields using invoice number + supplier GSTIN."""
     try:
         frame = pd.read_excel(BytesIO(template_bytes), sheet_name="NCR", dtype=object)
     except Exception:
         frame = pd.read_excel(BytesIO(template_bytes), dtype=object)
     frame.columns = [_india_clean_text(c) for c in frame.columns]
-    required = ["Invoice Number", "GSTIN", "Amount- Duty/IGST", "Tax field", "Total (amount+tax)", "Inv Date", "Line Description"]
+    required = ["Invoice Number", "GSTIN", "Amount- Duty/IGST", "Tax field", "Total (amount+tax)", "Inv Date", "Line Description", "Header Description to submit Weekly File"]
     missing = [c for c in required if c not in frame.columns]
     if missing:
         raise ValueError("The uploaded template is missing required columns.")
@@ -231,6 +237,8 @@ def _india_make_csv(template_bytes: bytes, pdf_uploads, quarter: str, year: int)
         if pd.isna(row.get("Inv Date")) and record["invoice_date"]:
             frame.at[idx, "Inv Date"] = record["invoice_date"]
         frame.at[idx, "Line Description"] = f"NCR TPM {quarter} {year} Invoice {invoice_number}"
+        fee_label = "Incident fee" if fee_type == "Incident_fee" else "TPM fee"
+        frame.at[idx, "Header Description to submit Weekly File"] = f"NCR_{fee_label} Upload_{upload_month} {upload_year}"
         results.append({
             "Invoice Number": invoice_number,
             "GSTIN": gstin,
@@ -836,20 +844,31 @@ with st.sidebar:
 
 if selected_region == "India":
     st.subheader("India — NCR AP Upload CSV")
-    st.caption("Upload the blank AP Excel template and the invoice PDFs. Matching requires both invoice number and supplier GSTIN.")
+    st.caption("The supplied NCR AP Excel template is built in. Upload the matching invoice PDFs; matching requires both invoice number and supplier GSTIN.")
     qcol, ycol = st.columns(2)
     with qcol:
         selected_quarter = st.selectbox("Invoice quarter", ["Q1", "Q2", "Q3", "Q4"], index=3)
     with ycol:
         selected_year = st.selectbox("Invoice year", list(range(datetime.now().year - 2, datetime.now().year + 4)), index=2)
-    template_file = st.file_uploader("Upload NCR Invoice AP Upload Excel template", type=["xlsx"], key="india_template")
+    fcol, mcol, mycol = st.columns(3)
+    with fcol:
+        selected_fee_type = st.selectbox("Weekly file description", ["Incident_fee", "TPM_fee"], index=0)
+    with mcol:
+        selected_upload_month = st.selectbox("Weekly file month", ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"], index=datetime.now().month - 1)
+    with mycol:
+        selected_upload_year = st.selectbox("Weekly file year", list(range(datetime.now().year - 2, datetime.now().year + 4)), index=2)
+    _template_path = Path(__file__).resolve().with_name("NCR Invoice AP Upload file Blank.xlsx")
     india_pdfs = st.file_uploader("Upload matching invoice PDFs", type=["pdf"], accept_multiple_files=True, key="india_pdfs")
-    if template_file and india_pdfs:
+    if india_pdfs:
         if st.button("Generate India CSV", type="primary", use_container_width=True):
             try:
                 with st.spinner("Matching invoice numbers and supplier GSTINs..."):
+                    if not _template_path.is_file():
+                        raise FileNotFoundError("Default NCR template is unavailable.")
+                    template_bytes = _template_path.read_bytes()
                     india_frame, india_results, india_unmatched, india_duplicates = _india_make_csv(
-                        template_file.getvalue(), india_pdfs, selected_quarter, int(selected_year)
+                        template_bytes, india_pdfs, selected_quarter, int(selected_year),
+                        selected_fee_type, selected_upload_month, int(selected_upload_year)
                     )
                 st.session_state["india_csv_bytes"] = india_frame.to_csv(index=False, date_format="%m/%d/%Y").encode("utf-8-sig")
                 st.session_state["india_csv_name"] = f"NCR Invoice AP Upload file {datetime.now().strftime('%m.%d.%Y')}.csv"
@@ -858,7 +877,7 @@ if selected_region == "India":
                 st.session_state["india_duplicates"] = india_duplicates
                 st.success(f"CSV prepared with {len(india_results)} matched invoice record(s).")
             except Exception:
-                st.error("The India template or invoice PDFs could not be processed. Check the template columns and PDF files.")
+                st.error("The default NCR template or invoice PDFs could not be processed. Check the bundled template and PDF files.")
         if st.session_state.get("india_results") is not None:
             st.subheader("Matched invoice review")
             review = pd.DataFrame(st.session_state["india_results"])
@@ -875,7 +894,7 @@ if selected_region == "India":
                 use_container_width=True,
             )
     else:
-        st.info("Upload the Excel template and the corresponding invoice PDFs to generate the India CSV.")
+        st.info("Upload the corresponding invoice PDFs to generate the India CSV using the built-in NCR template.")
     st.stop()
 
 uploaded_pdf = st.file_uploader("Upload invoice PDF", type=["pdf"])
