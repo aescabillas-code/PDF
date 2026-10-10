@@ -140,7 +140,7 @@ def _amount_near_label(text: str, labels: list[str]) -> Optional[float]:
     # Handle flattened text by restricting the search to text after this label and
     # before the next financial label.
     compact = re.sub(r"\\s+", " ", text or "")
-    label_pattern = r"NET\\s*AMOUNT\\s*\\(?\\s*USD\\s*\\)?|TOTAL\\s+REGION\\s+VAT\\s*/\\s*TAXES\\s*\\(?\\s*USD\\s*\\)?|TOTAL\\s+G\\.?S\\.?T\\.?|TOTAL\\s+GST|TOTAL\\s+AMOUNT\\s*\\(?\\s*USD\\s*\\)?|INVOICE\\s+TOTAL|SUBTOTAL|\\bVAT\\b|AMOUNT\\s+DUE"
+    label_pattern = r"NET\s*AMOUNT\s*\(?\s*USD\s*\)?|TOTAL\s+REGION\s+VAT\s*/\s*TAXES\s*\(?\s*USD\s*\)?|TOTAL\s+G\.?S\.?T\.?|TOTAL\s+GST|TOTAL\s+AMOUNT\s*\(?\s*USD\s*\)?|INVOICE\s+TOTAL|SUBTOTAL|\bVAT\b|AMOUNT\s+DUE"
     for label in sorted(labels, key=len, reverse=True):
         match = re.search(re.escape(label), compact, re.I)
         if match:
