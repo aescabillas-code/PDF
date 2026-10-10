@@ -69,13 +69,16 @@ REGION_RULES = {region: {} for region in REGION_LABELS}
 NET_LABEL = "Net amount / Subtotal"
 VAT_LABEL = "Tax amount / VAT / GST"
 MONEY_RE = re.compile(r"(?<![A-Z0-9])\$?\s*([\d,]+\.\d{2})(?!\d)")
-EMAIL_RE = re.compile(r"[\\w.+-]+@[\\w.-]+\\.[A-Za-z]{2,}")
-APPROVAL_RE = re.compile(r"Approved\\s+by\\s+(.+?)\\s+(\\d{2}[./-]\\d{2}[./-]\\d{4})", re.I)
+EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
+APPROVAL_RE = re.compile(r"Approved\s+by\\s+(.+?)\\s+(\\d{2}[./-]\\d{2}[./-]\\d{4})", re.I)
 
 
 def normalize_region(value: str) -> str:
-    value = re.sub(r"\\s+", " ", (value or "").strip())
-    return REGION_ALIASES.get(value.upper(), value)
+    value = re.sub(r"\s+", " ", (value or "").strip())
+    alias_map = {key.upper(): canonical for key, canonical in REGION_ALIASES.items()}
+    canonical_map = {name.upper(): name for name in REGION_LABELS}
+    upper = value.upper()
+    return alias_map.get(upper, canonical_map.get(upper, value))
 
 
 def money_after(text: str, start: int = 0) -> Optional[float]:
@@ -98,7 +101,10 @@ APPROVAL_RE = re.compile(r"Approved\s+by\s+(.+?)\s+(\d{2}[./-]\d{2}[./-]\d{4})",
 
 def normalize_region(value: str) -> str:
     value = re.sub(r"\s+", " ", (value or "").strip())
-    return REGION_ALIASES.get(value.upper(), value)
+    alias_map = {key.upper(): canonical for key, canonical in REGION_ALIASES.items()}
+    canonical_map = {name.upper(): name for name in REGION_LABELS}
+    upper = value.upper()
+    return alias_map.get(upper, canonical_map.get(upper, value))
 
 
 def money_after(text: str, start: int = 0) -> Optional[float]:
@@ -108,7 +114,7 @@ def money_after(text: str, start: int = 0) -> Optional[float]:
 
 def _amount_near_label(text: str, labels: list[str]) -> Optional[float]:
     """Extract the amount associated with a label, avoiding other summary columns."""
-    lines = [re.sub(r"\\s+", " ", line).strip() for line in (text or "").splitlines() if line.strip()]
+    lines = [re.sub(r"\s+", " ", line).strip() for line in (text or "").splitlines() if line.strip()]
     upper_lines = [line.upper() for line in lines]
     stop_labels = (
         "NET AMOUNT", "TOTAL G.S.T", "TOTAL GST", "TOTAL REGION VAT/TAXES",
@@ -139,7 +145,7 @@ def _amount_near_label(text: str, labels: list[str]) -> Optional[float]:
                 return float(values[-1].group(1).replace(",", ""))
     # Handle flattened text by restricting the search to text after this label and
     # before the next financial label.
-    compact = re.sub(r"\\s+", " ", text or "")
+    compact = re.sub(r"\s+", " ", text or "")
     label_pattern = r"NET\s*AMOUNT\s*\(?\s*USD\s*\)?|TOTAL\s+REGION\s+VAT\s*/\s*TAXES\s*\(?\s*USD\s*\)?|TOTAL\s+G\.?S\.?T\.?|TOTAL\s+GST|TOTAL\s+AMOUNT\s*\(?\s*USD\s*\)?|INVOICE\s+TOTAL|SUBTOTAL|\bVAT\b|AMOUNT\s+DUE"
     for label in sorted(labels, key=len, reverse=True):
         match = re.search(re.escape(label), compact, re.I)
@@ -165,7 +171,7 @@ def extract_labeled_gl_rows(text: str, region: str) -> tuple[list[dict], Optiona
 
     # If the PDF text extractor puts table headers on one line and values on the
     # next, match the value position by the horizontal order of the header labels.
-    lines = [re.sub(r"\\s+", " ", line).strip() for line in (text or "").splitlines() if line.strip()]
+    lines = [re.sub(r"\s+", " ", line).strip() for line in (text or "").splitlines() if line.strip()]
     for idx, line in enumerate(lines):
         upper = line.upper()
         net_pos = min((upper.find(x.upper()) for x in labels["net"] if upper.find(x.upper()) >= 0), default=-1)
@@ -210,16 +216,37 @@ def _region_gl_codes(region: str) -> dict:
 
 
 def classify_rows(region: str, rows: list[dict]) -> list[dict]:
+    """Assign region-specific descriptions using only that region's secret GL codes."""
+    region = normalize_region(region)
     codes = _region_gl_codes(region)
+    labels = {
+        "AU": {
+            "net": "AU — Net Amount",
+            "vat": "AU — Total G.S.T",
+        },
+        "NA and LATAM": {
+            "net": "NA and LATAM — NET AMOUNT (USD)",
+            "vat": "NA and LATAM — TOTAL REGION VAT/TAXES (USD)",
+        },
+        "EMEA & APAC": {
+            "net": "EMEA & APAC — NET AMOUNT (USD)",
+            "vat": "EMEA & APAC — TOTAL REGION VAT/TAXES (USD)",
+        },
+        "UK": {
+            "net": "UK — SUBTOTAL",
+            "vat": "UK — VAT",
+        },
+    }
+    region_labels = labels.get(region, {"net": "Net amount label", "vat": "Tax amount label"})
     classified = []
     for row in rows:
         code = str(row.get("Juniper GL Code", "")).strip()
-        if code and code == codes.get("net"):
-            label = NET_LABEL
-        elif code and code == codes.get("vat"):
-            label = VAT_LABEL
+        if code and codes.get("net") and code == codes["net"]:
+            label = region_labels["net"]
+        elif code and codes.get("vat") and code == codes["vat"]:
+            label = region_labels["vat"]
         else:
-            label = "Review — code not configured in secrets"
+            label = f"Review — GL code not configured for {region or 'selected region'}"
         classified.append({**row, "Classification": label})
     return classified
 
@@ -247,9 +274,9 @@ def validate_rows(region: str, rows: list[dict], total: Optional[float]) -> list
 
 
 def extract_from_page(text: str, region_hint: Optional[str] = None) -> dict:
-    lines = [re.sub(r"\\s+", " ", line).strip() for line in (text or "").splitlines() if line.strip()]
+    lines = [re.sub(r"\s+", " ", line).strip() for line in (text or "").splitlines() if line.strip()]
     region = normalize_region(region_hint or "")
-    invoice_match = re.search(r"INVOICE NUMBER\\s*([A-Z0-9-]+)", text or "", re.I)
+    invoice_match = re.search(r"INVOICE NUMBER\s*([A-Z0-9-]+)", text or "", re.I)
     approver = approval_date = email = ""
     for line in lines:
         match = APPROVAL_RE.search(line)
@@ -357,39 +384,6 @@ def find_candidate_pages(pdf_bytes: bytes) -> tuple[list[tuple[int, str]], bool]
     finally:
         document.close()
 
-
-def classify_rows(region: str, rows: list[dict]) -> list[dict]:
-    region_codes = _region_gl_codes(region)
-    classified = []
-    for row in rows:
-        code = str(row["Juniper GL Code"])
-        if code == str(region_codes.get("net", "")):
-            label = NET_LABEL
-        elif code == str(region_codes.get("vat", "")):
-            label = VAT_LABEL
-        else:
-            label = "Review — region/code not mapped"
-        classified.append({**row, "Classification": label})
-    return classified
-
-
-def validate_rows(region: str, rows: list[dict], total: Optional[float]) -> list[str]:
-    warnings = []
-    if region not in REGION_RULES:
-        warnings.append("Select a configured region before stamping.")
-    if not rows:
-        warnings.append("No GL rows detected.")
-    if any(row["Amount"] is None for row in rows):
-        warnings.append("At least one amount could not be paired confidently with its GL code.")
-    if any(row["Classification"].startswith("Review") for row in rows):
-        warnings.append("At least one GL suffix is not mapped for this region.")
-    if total is None:
-        warnings.append("Total amount was not detected.")
-    elif rows and all(row["Amount"] is not None for row in rows):
-        calculated = round(sum(float(row["Amount"]) for row in rows), 2)
-        if calculated != round(float(total), 2):
-            warnings.append("Line amounts do not match the detected total. Review the values.")
-    return warnings
 
 
 def stamp_pdf(
