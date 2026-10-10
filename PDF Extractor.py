@@ -486,18 +486,23 @@ def stamp_pdf(
         if stamp_width < 250 or stamp_height > page_rect.height - 36:
             raise ValueError("Stamp does not fit on the selected page.")
 
-        # Occupied text blocks are expanded slightly to preserve a visual margin.
+        # Use individual text-line/span boxes rather than broad PDF text blocks.
+        # Some invoice PDFs group widely separated columns into one large block;
+        # treating that block as occupied falsely rejects otherwise blank space.
         occupied = []
-        for block in page.get_text("blocks"):
-            if len(block) < 5:
-                continue
-            x0, y0, x1, y1 = map(float, block[:4])
-            block_text = str(block[4]).strip()
-            if not block_text:
-                continue
-            rect = pymupdf.Rect(x0, y0, x1, y1)
-            if rect.intersects(page_rect):
-                occupied.append((rect, block_text))
+        text_dict = page.get_text("dict")
+        for block in text_dict.get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    span_text = str(span.get("text", "")).strip()
+                    if not span_text:
+                        continue
+                    bbox = span.get("bbox")
+                    if not bbox or len(bbox) != 4:
+                        continue
+                    rect = pymupdf.Rect(*map(float, bbox))
+                    if rect.intersects(page_rect):
+                        occupied.append((rect, span_text))
 
         margin_x, margin_y = 22, 18
         x_min = margin_x
@@ -507,11 +512,10 @@ def stamp_pdf(
         if x_max < x_min or y_max < y_min:
             raise ValueError("Stamp does not fit on the selected page.")
 
-        # Search a coarse grid, then rank clear positions by closeness to the
-        # center of the page. Include extra candidates around text-block edges,
-        # which often correspond to the large blank section beneath invoice tables.
-        x_step = max(12, min(24, stamp_width / 14))
-        y_step = max(10, min(20, stamp_height / 3))
+        # Search more densely so valid whitespace between invoice sections is
+        # not missed because the old coarse grid stepped over it.
+        x_step = 8
+        y_step = 6
         xs = {x_min, x_max, (x_min + x_max) / 2}
         ys = {y_min, y_max, (y_min + y_max) / 2}
         x = x_min
@@ -523,11 +527,12 @@ def stamp_pdf(
             ys.add(y)
             y += y_step
 
+        # Include positions immediately above/below and beside detected text.
         for rect, _ in occupied:
-            for candidate_x in (rect.x0 - stamp_width - 10, rect.x1 + 10):
+            for candidate_x in (rect.x0 - stamp_width - 4, rect.x1 + 4):
                 if x_min <= candidate_x <= x_max:
                     xs.add(candidate_x)
-            for candidate_y in (rect.y0 - stamp_height - 10, rect.y1 + 10):
+            for candidate_y in (rect.y0 - stamp_height - 4, rect.y1 + 4):
                 if y_min <= candidate_y <= y_max:
                     ys.add(candidate_y)
 
