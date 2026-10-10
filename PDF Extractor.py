@@ -15,6 +15,8 @@ Run:
 from __future__ import annotations
 
 import re
+import math
+from collections import Counter
 from typing import Optional
 from datetime import datetime
 
@@ -856,228 +858,260 @@ def stamp_pdf(
 
 
 
+# -----------------------------------------------------------------------------
+# Tool navigation and Vendor SOW Analyzer (kept separate from PDF stamping)
+# -----------------------------------------------------------------------------
+SOW_STOPWORDS = set("""a an and are as at be by for from has have in into is it of on or our that the their this to with will can may must should shall services service scope work works vendor supplier client customer global regional local support manage management provide provision including include includes across per via using use used related applicable requirements requirement deliver deliverables delivery activities activity responsibilities responsibility""".split())
 
 
-# ---------------- Vendor SOW Scope Comparator (add-on tool) ----------------
-SOW_SCOPE_CATEGORIES = {
-    "Service desk & end-user support": ["service desk", "help desk", "end user support", "user support", "desktop support", "level 1", "level 2", "level 3", "l1", "l2", "l3"],
-    "Incident & problem management": ["incident management", "problem management", "major incident", "incident resolution", "root cause", "rca"],
-    "Request & change management": ["service request", "request fulfilment", "request fulfillment", "change management", "change request", "change control"],
-    "Onsite / field services": ["onsite", "on-site", "field service", "dispatch", "smart hands", "break fix", "break-fix", "field engineer"],
-    "Hardware lifecycle & repair": ["hardware repair", "hardware maintenance", "warranty", "rma", "asset lifecycle", "device lifecycle", "parts replacement"],
-    "Network & connectivity": ["network support", "network operations", "lan", "wan", "wireless", "connectivity", "router", "switch"],
-    "Server / data center": ["data center", "data centre", "server support", "compute", "storage support", "rack and stack", "rack-and-stack"],
-    "Cloud & platform operations": ["cloud operations", "cloud support", "azure", "aws", "gcp", "platform operations", "virtualization"],
-    "Security & compliance": ["security operations", "cybersecurity", "security monitoring", "compliance", "vulnerability", "patch management", "access control"],
-    "Monitoring & reporting": ["monitoring", "event management", "service reporting", "dashboard", "performance reporting", "monthly report", "sla reporting"],
-    "SLA / service governance": ["service level agreement", "sla", "service governance", "service review", "continuous improvement", "kpi", "service credits"],
-    "Global / multi-region coverage": ["global coverage", "global support", "worldwide", "multi-country", "multi country", "regional coverage", "24x7", "24/7", "follow the sun"],
-    "Procurement / vendor coordination": ["vendor management", "third-party", "third party", "supplier coordination", "procurement", "contract management", "subcontractor"],
-    "Transition / knowledge management": ["transition", "knowledge transfer", "knowledge management", "runbook", "documentation", "training", "handover"],
-}
-
-def _sow_extract_text(uploaded_file) -> str:
-    """Read supported SOW documents from memory; never persist source documents."""
-    name = uploaded_file.name.lower()
-    data = uploaded_file.getvalue()
-    if name.endswith(".pdf"):
-        doc = pymupdf.open(stream=data, filetype="pdf")
+def _sow_read_upload(uploaded):
+    """Read supported SOW/capability documents in memory; never write uploads to disk."""
+    name = uploaded.name
+    data = uploaded.getvalue()
+    suffix = name.rsplit('.', 1)[-1].lower() if '.' in name else ''
+    if suffix == 'pdf':
+        doc = pymupdf.open(stream=data, filetype='pdf')
         try:
-            return "\n".join(page.get_text("text") for page in doc)
+            return '\n'.join(page.get_text('text') for page in doc)
         finally:
             doc.close()
-    if name.endswith(".docx"):
-        try:
-            from docx import Document
-            doc = Document(BytesIO(data))
-            chunks = [p.text for p in doc.paragraphs if p.text.strip()]
-            for table in doc.tables:
-                for row in table.rows:
-                    chunks.append(" | ".join(cell.text.strip() for cell in row.cells))
-            return "\n".join(chunks)
-        except Exception as exc:
-            raise ValueError("DOCX could not be read. Install python-docx and retry.") from exc
-    if name.endswith((".txt", ".md", ".csv")):
-        return data.decode("utf-8-sig", errors="replace")
-    if name.endswith((".xlsx", ".xlsm")):
-        frame = pd.read_excel(BytesIO(data), sheet_name=None, dtype=str)
-        return "\n".join(
-            f"Sheet: {sheet}\n" + table.fillna("").astype(str).to_csv(index=False, header=True)
-            for sheet, table in frame.items()
-        )
-    if name.endswith(".doc"):
-        raise ValueError("Legacy .doc files are not supported. Save them as .docx or PDF first.")
-    raise ValueError("Unsupported document type.")
+    if suffix in ('txt', 'md', 'csv'):
+        return data.decode('utf-8', errors='replace')
+    if suffix in ('docx', 'docm'):
+        from docx import Document
+        document = Document(BytesIO(data))
+        parts = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
+        for table in document.tables:
+            for row in table.rows:
+                parts.append(' | '.join(cell.text.strip() for cell in row.cells))
+        return '\n'.join(parts)
+    if suffix in ('xlsx', 'xlsm', 'xls'):
+        sheets = pd.read_excel(BytesIO(data), sheet_name=None, dtype=str)
+        parts = []
+        for sheet_name, frame in sheets.items():
+            parts.append(f'SHEET: {sheet_name}')
+            parts.append(frame.fillna('').astype(str).to_csv(index=False))
+        return '\n'.join(parts)
+    if suffix == 'pptx':
+        from pptx import Presentation
+        presentation = Presentation(BytesIO(data))
+        parts = []
+        for slide in presentation.slides:
+            for shape in slide.shapes:
+                if getattr(shape, 'has_text_frame', False) and shape.text.strip():
+                    parts.append(shape.text)
+                if getattr(shape, 'has_table', False):
+                    for row in shape.table.rows:
+                        parts.append(' | '.join(cell.text for cell in row.cells))
+        return '\n'.join(parts)
+    raise ValueError('Unsupported document format')
 
-def _sow_normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").lower()).strip()
 
-def _sow_analyze_document(name: str, text: str, is_global: bool = False) -> dict:
-    normalized = _sow_normalize(text)
-    categories = {}
-    for category, terms in SOW_SCOPE_CATEGORIES.items():
-        found = [term for term in terms if term in normalized]
-        if found:
-            # Retain a short source excerpt as traceable evidence, not just a keyword score.
-            term = max(found, key=len)
-            pos = normalized.find(term)
-            excerpt = normalized[max(0, pos - 100):min(len(normalized), pos + len(term) + 180)]
-            categories[category] = {"status": "Covered" if len(set(found)) >= 2 else "Potential", "terms": found, "evidence": excerpt}
-    return {"name": name, "text": text, "normalized": normalized, "categories": categories, "is_global": is_global}
+def _sow_normalize(text):
+    return re.sub(r'[^a-z0-9]+', ' ', (text or '').lower()).strip()
 
-def _sow_render_tool():
-    st.markdown("""
-    <style>
-    .sow-hero{padding:1.1rem 1.35rem;border-radius:14px;background:linear-gradient(120deg,#003f35,#008a69);color:#fff;margin-bottom:1rem}
-    .sow-hero h2{color:#fff;margin:0}.sow-hero p{color:#e7fff6;margin:.35rem 0 0}
-    </style>
-    <div class="sow-hero"><h2>Vendor SOW Scope Comparator</h2>
-    <p>Compare vendor Statements of Work against a global provider's baseline, identify a three-vendor coverage team, and rank three backups.</p></div>
-    """, unsafe_allow_html=True)
-    st.caption("Supported files: PDF, DOCX, XLSX/XLSM, TXT, MD, and CSV. Documents are processed in memory. The analysis is a keyword-and-evidence-based screening aid; verify contract language and exclusions before making a sourcing decision.")
-    global_file = st.file_uploader("1. Upload the global vendor SOW (baseline)", type=["pdf", "docx", "xlsx", "xlsm", "txt", "md", "csv"], key="sow_global_upload")
-    vendor_files = st.file_uploader("2. Upload vendor SOWs / capability documents", type=["pdf", "docx", "xlsx", "xlsm", "txt", "md", "csv"], accept_multiple_files=True, key="sow_vendor_uploads")
-    with st.expander("How matching works", expanded=False):
-        st.write("The tool detects scope categories and supporting wording in each document, compares vendors against categories found in the global SOW, and ranks combinations by covered categories. 'Potential' means the document contains a relevant keyword but evidence may be incomplete. Absence of a keyword is a gap to validate, not proof the vendor cannot perform the work.")
-    if not global_file:
-        st.info("Upload the global vendor SOW first. Its detected scope becomes the comparison baseline.")
-        return
-    if not vendor_files:
-        st.info("Upload at least three vendor documents to generate the comparison table, graph, and primary / backup recommendations.")
-        return
-    try:
-        baseline = _sow_analyze_document(global_file.name, _sow_extract_text(global_file), True)
-        vendors = [_sow_analyze_document(f.name, _sow_extract_text(f)) for f in vendor_files]
-    except Exception:
-        st.error("One or more documents could not be read. Check that the files are valid and in a supported format.")
-        return
-    baseline_cats = list(baseline["categories"])
-    if not baseline_cats:
-        st.warning("No standard scope categories were detected in the global SOW. Review the document text or add a searchable version of the file.")
-        with st.expander("Extracted global SOW text"):
-            st.text((baseline["text"] or "")[:12000])
-        return
-    st.subheader("Global vendor baseline")
-    st.write(f"**{baseline['name']}** — {len(baseline_cats)} scope categories detected.")
-    st.dataframe(pd.DataFrame([
-        {"Global scope category": c, "Detected terms": ", ".join(baseline["categories"][c]["terms"]), "Evidence excerpt": baseline["categories"][c]["evidence"]}
-        for c in baseline_cats
-    ]), use_container_width=True, hide_index=True)
 
-    matrix_rows, vendor_scores = [], []
-    for vendor in vendors:
-        full, potential, gaps = [], [], []
-        for category in baseline_cats:
-            item = vendor["categories"].get(category)
-            if item and item["status"] == "Covered":
-                status = "Covered"; full.append(category)
-            elif item:
-                status = "Potential"; potential.append(category)
-            else:
-                status = "Gap"; gaps.append(category)
-            matrix_rows.append({"Vendor": vendor["name"], "Scope category": category, "Status": status,
-                                "Evidence terms": ", ".join(item["terms"]) if item else "",
-                                "Evidence excerpt": item["evidence"] if item else "No matching scope wording detected"})
-        score = (len(full) + 0.5 * len(potential)) / len(baseline_cats) * 100
-        vendor_scores.append({"Vendor": vendor["name"], "Coverage score (%)": round(score, 1),
-                              "Covered": len(full), "Potential": len(potential), "Gaps": len(gaps),
-                              "Covered categories": full, "Potential categories": potential, "Gap categories": gaps})
-    scores_df = pd.DataFrame(vendor_scores).sort_values(["Coverage score (%)", "Covered", "Potential"], ascending=False).reset_index(drop=True)
-    matrix_df = pd.DataFrame(matrix_rows)
-    st.subheader("Vendor coverage overview")
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Baseline scope categories", len(baseline_cats))
-    k2.metric("Vendor documents analyzed", len(vendors))
-    k3.metric("Vendors with 80%+ screening score", int((scores_df["Coverage score (%)"] >= 80).sum()))
-    st.bar_chart(scores_df.set_index("Vendor")[["Coverage score (%)"]])
-    st.caption("Screening score weights a detected category as Covered = 100% and Potential = 50%; it is not a legal or contractual guarantee.")
-    st.subheader("Coverage score table")
-    st.dataframe(scores_df[["Vendor", "Coverage score (%)", "Covered", "Potential", "Gaps"]], use_container_width=True, hide_index=True)
+def _sow_sentences(text):
+    text = re.sub(r'\s+', ' ', text or '')
+    pieces = re.split(r'(?<=[.!?;])\s+|\n+', text)
+    return [piece.strip(' \t-•*') for piece in pieces if len(piece.strip()) >= 18]
 
-    # Greedy complementary selection: each added vendor should contribute the most
-    # currently uncovered baseline categories, with confidence score as tie-breaker.
-    remaining = set(baseline_cats)
-    primary, used = [], set()
-    for _ in range(min(3, len(vendors))):
-        choices = []
-        for vendor in vendors:
-            if vendor["name"] in used:
-                continue
-            covered_set = {c for c in baseline_cats if vendor["categories"].get(c, {}).get("status") == "Covered"}
-            potential_set = {c for c in baseline_cats if c in vendor["categories"] and vendor["categories"][c]["status"] == "Potential"}
-            incremental = len(covered_set & remaining) + 0.5 * len(potential_set & remaining)
-            overall = next(x["Coverage score (%)"] for x in vendor_scores if x["Vendor"] == vendor["name"])
-            choices.append((incremental, overall, vendor, covered_set, potential_set))
-        if not choices:
+
+def _sow_terms(text, limit=120):
+    tokens = re.findall(r'[a-z][a-z0-9+#./-]{2,}', (text or '').lower())
+    counts = Counter(token.strip('./-') for token in tokens if token not in SOW_STOPWORDS and len(token.strip('./-')) > 2)
+    return [word for word, _ in counts.most_common(limit)]
+
+
+def _sow_extract_scope(text, limit=80):
+    sentences = _sow_sentences(text)
+    if not sentences:
+        return []
+    action_terms = ('provide', 'support', 'manage', 'maintain', 'monitor', 'deliver', 'install', 'repair', 'operate', 'service', 'deploy', 'configure', 'resolve', 'respond', 'process', 'administer', 'coordinate', 'review', 'assess', 'implement', 'upgrade', 'replace', 'dispatch', 'onsite', 'on-site', 'remote', '24/7', '24x7', 'sla', 'coverage')
+    selected = [s for s in sentences if any(term in s.lower() for term in action_terms)]
+    # If a document is mostly tables or terse bullet points, keep meaningful lines too.
+    if len(selected) < min(8, len(sentences)):
+        selected.extend(s for s in sentences if s not in selected and len(s.split()) >= 5)
+    unique, seen = [], set()
+    for sentence in selected:
+        key = _sow_normalize(sentence)
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(sentence)
+        if len(unique) >= limit:
             break
-        _, _, chosen, cov, pot = max(choices, key=lambda x: (x[0], x[1]))
-        primary.append(chosen)
-        used.add(chosen["name"])
-        remaining -= (cov | pot)
-    backups = [v for v in vendors if v["name"] not in used]
-    backups.sort(key=lambda v: next(x["Coverage score (%)"] for x in vendor_scores if x["Vendor"] == v["name"]), reverse=True) 
-    backups = backups[:3]
-    def combined_coverage(selected):
-        covered, potential = set(), set()
-        for v in selected:
-            for c in baseline_cats:
-                item = v["categories"].get(c)
-                if item and item["status"] == "Covered": covered.add(c)
-                elif item: potential.add(c)
-        potential -= covered
-        return covered, potential
-    prim_cov, prim_pot = combined_coverage(primary)
-    st.subheader("Recommended primary coverage team — up to 3 vendors")
-    st.caption("Selected for complementary scope coverage, not just the highest individual scores.")
-    if primary:
-        st.dataframe(pd.DataFrame([{
-            "Rank": i + 1, "Vendor": v["name"],
-            "Individual coverage (%)": next(x["Coverage score (%)"] for x in vendor_scores if x["Vendor"] == v["name"]),
-            "Baseline categories covered": len({c for c in baseline_cats if v["categories"].get(c, {}).get("status") == "Covered"}),
-            "Potential categories": len({c for c in baseline_cats if c in v["categories"] and v["categories"][c]["status"] == "Potential"}),
-        } for i, v in enumerate(primary)]), use_container_width=True, hide_index=True)
-        st.progress(min(1.0, (len(prim_cov) + 0.5 * len(prim_pot)) / len(baseline_cats)))
-        st.write(f"**Combined screening coverage:** {len(prim_cov)} covered, {len(prim_pot)} potential, {len(set(baseline_cats) - prim_cov - prim_pot)} gaps out of {len(baseline_cats)} baseline categories.")
-    st.subheader("Backup vendors — next 3 candidates")
-    if backups:
-        st.dataframe(scores_df[scores_df["Vendor"].isin([v["name"] for v in backups])][["Vendor", "Coverage score (%)", "Covered", "Potential", "Gaps"]].reset_index(drop=True), use_container_width=True, hide_index=True)
-    else:
-        st.info("No additional vendors are available as backups. Upload more vendor documents to rank backup candidates.")
-
-    st.subheader("Scope-by-vendor comparison matrix")
-    pivot = matrix_df.pivot(index="Scope category", columns="Vendor", values="Status").reindex(baseline_cats)
-    st.dataframe(pivot, use_container_width=True)
-    selected_vendor_name = st.selectbox("Inspect supporting evidence", [v["name"] for v in vendors], key="sow_evidence_vendor")
-    evidence_view = matrix_df[matrix_df["Vendor"] == selected_vendor_name][["Scope category", "Status", "Evidence terms", "Evidence excerpt"]]
-    st.dataframe(evidence_view, use_container_width=True, hide_index=True)
-    report = matrix_df.merge(scores_df[["Vendor", "Coverage score (%)"]], on="Vendor", how="left")
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        scores_df[["Vendor", "Coverage score (%)", "Covered", "Potential", "Gaps"]].to_excel(writer, index=False, sheet_name="Vendor Scores")
-        report.to_excel(writer, index=False, sheet_name="Scope Evidence")
-        pivot.reset_index().to_excel(writer, index=False, sheet_name="Coverage Matrix")
-        pd.DataFrame([{"Role": "Primary", "Rank": i + 1, "Vendor": v["name"]} for i, v in enumerate(primary)] +
-                     [{"Role": "Backup", "Rank": i + 1, "Vendor": v["name"]} for i, v in enumerate(backups)]).to_excel(writer, index=False, sheet_name="Recommendations")
-    st.download_button("Download SOW comparison report (Excel)", data=output.getvalue(),
-                       file_name="Vendor_SOW_Scope_Comparison.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                       use_container_width=True)
-# ---------------- End Vendor SOW Scope Comparator ----------------
+    return unique
 
 
-if st.session_state.get("active_tool", "pdf") != "sow":
+def _sow_similarity(scope, vendor_text):
+    """Conservative lexical similarity with explicit evidence, not a legal conclusion."""
+    a = set(_sow_terms(scope, 500))
+    b = set(_sow_terms(vendor_text, 1200))
+    if not a:
+        return 0.0, []
+    overlap = a & b
+    # Recall-like measure prioritizes whether the vendor document mentions required scope.
+    score = 100 * len(overlap) / len(a)
+    return round(min(score, 100), 1), sorted(overlap)
+
+
+def _sow_scope_label(sentence):
+    cleaned = re.sub(r'\s+', ' ', sentence).strip()
+    return cleaned[:180] + ('…' if len(cleaned) > 180 else '')
+
+
+# Navigation controls remain in the lower-left sidebar. The active tool determines
+# which page header is rendered, so the PDF Approval Stamp Tool header is absent in SOW mode.
+if 'active_tool' not in st.session_state:
+    st.session_state['active_tool'] = 'PDF Approval Stamp Tool'
+with st.sidebar:
+    st.markdown('<div style="height:0.5rem"></div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:0.78rem;font-weight:700;color:#64748b;margin-bottom:0.4rem">TOOLS</div>', unsafe_allow_html=True)
+    if st.button('PDF Approval Stamp Tool', key='nav_pdf_stamp', use_container_width=True):
+        st.session_state['active_tool'] = 'PDF Approval Stamp Tool'
+        st.rerun()
+    if st.button('Vendor SOW Analyzer', key='nav_vendor_sow', use_container_width=True):
+        st.session_state['active_tool'] = 'Vendor SOW Analyzer'
+        st.rerun()
+
+if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
     st.markdown("""
     <style>
-    .block-container {padding-top: 1.5rem; max-width: 1400px;}
-    .hero {padding: 1.2rem 1.4rem; border-radius: 14px; background: linear-gradient(120deg,#006B4F,#008A69); color: white; margin-bottom: 1rem;}
-    .hero h1 {color:white; margin:0;}
-    .hero p {color:#e7fff6; margin:.35rem 0 0 0;}
+    .block-container {padding-top: 1.4rem; max-width: 1500px;}
+    div[data-testid="stButton"] button {border-radius:9px;font-weight:650;}
+    .sow-hero {padding:1.15rem 1.4rem;border-radius:14px;background:linear-gradient(120deg,#006B4F,#008A69);color:#fff;margin-bottom:1rem;}
+    .sow-hero h1 {color:#fff;margin:0;font-size:1.8rem;}
+    .sow-hero p {color:#e7fff6;margin:.35rem 0 0 0;}
     </style>
-    <div class="hero">
-    <h1>PDF Approval Stamp Tool</h1>
-    <p>Extract Juniper GL details, validate approval totals, and stamp a separate copy of an invoice.</p>
-    </div>
+    <div class="sow-hero"><h1>Vendor SOW Analyzer</h1><p>Compare vendor scope, identify overlapping capabilities, and shortlist primary and backup coverage.</p></div>
     """, unsafe_allow_html=True)
+    st.caption('Upload a global SOW as the target scope when available, plus vendor SOWs and capability documents. If no baseline is available, the analyzer identifies common and complementary work across vendors. Files are read in memory.')
+    with st.expander('How the recommendations work', expanded=False):
+        st.write('The analyzer extracts text and compares scope terms and evidence statements. It recommends a set of up to 3 primary vendors and up to 3 backups using a coverage-first selection. Similarity is a screening aid, not a contractual determination; verify exclusions, geography, SLAs, staffing, certifications, and commercial terms in the source documents.')
+    baseline_file = st.file_uploader('Global vendor SOW / baseline (optional)', type=['pdf','docx','docm','xlsx','xlsm','xls','pptx','txt','md','csv'], key='sow_baseline')
+    vendor_files = st.file_uploader('Upload vendor SOWs and capability documents', type=['pdf','docx','docm','xlsx','xlsm','xls','pptx','txt','md','csv'], accept_multiple_files=True, key='sow_vendor_files')
+    if st.button('Analyze vendor scope', type='primary', use_container_width=True, key='run_sow_analysis'):
+        try:
+            parsed_vendors = []
+            for uploaded in vendor_files or []:
+                text_value = _sow_read_upload(uploaded)
+                if text_value.strip():
+                    parsed_vendors.append({'Vendor': uploaded.name.rsplit('.',1)[0], 'File': uploaded.name, 'Text': text_value, 'Scopes': _sow_extract_scope(text_value)})
+            baseline_text = _sow_read_upload(baseline_file) if baseline_file is not None else ''
+            baseline_scopes = _sow_extract_scope(baseline_text) if baseline_text.strip() else []
+            if len(parsed_vendors) < 2:
+                st.error('Upload at least two readable vendor SOW/capability documents to compare scope.')
+            else:
+                # Baseline mode compares every vendor against baseline scope statements.
+                # No-baseline mode builds a shared scope catalogue from the combined vendor documents.
+                if baseline_scopes:
+                    scope_items = baseline_scopes
+                    analysis_mode = 'Global baseline comparison'
+                else:
+                    combined = []
+                    seen_scope = set()
+                    for vendor in parsed_vendors:
+                        for scope in vendor['Scopes']:
+                            normalized = _sow_normalize(scope)
+                            if normalized and normalized not in seen_scope:
+                                seen_scope.add(normalized)
+                                combined.append(scope)
+                    scope_items = combined[:120]
+                    analysis_mode = 'Cross-vendor overlap (no global baseline)'
+                if not scope_items:
+                    st.error('No usable scope statements were detected. Upload text-based documents or documents with selectable text.')
+                else:
+                    matrix_rows = []
+                    per_vendor = {}
+                    for vendor in parsed_vendors:
+                        covered = []
+                        evidence_rows = []
+                        vendor_norm = _sow_normalize(vendor['Text'])
+                        for i, scope in enumerate(scope_items):
+                            score, terms = _sow_similarity(scope, vendor['Text'])
+                            # Exact normalized phrase match or high lexical overlap raises confidence.
+                            phrase = _sow_normalize(scope)
+                            phrase_present = bool(phrase and phrase in vendor_norm)
+                            status = 'Covered' if phrase_present or score >= 55 else ('Potential' if score >= 25 else 'Gap')
+                            if status != 'Gap':
+                                covered.append(i)
+                            evidence = next((line for line in vendor['Scopes'] if (phrase and phrase in _sow_normalize(line)) or (len(set(_sow_terms(scope, 40)) & set(_sow_terms(line, 100))) >= 3)), '')
+                            evidence_rows.append({'Scope requirement': _sow_scope_label(scope), 'Vendor': vendor['Vendor'], 'Status': status, 'Match score (%)': score, 'Matched terms': ', '.join(terms[:12]), 'Evidence excerpt': (evidence or 'No close excerpt found; manually review source document.')[:350]})
+                            matrix_rows.append({'Scope requirement': _sow_scope_label(scope), 'Vendor': vendor['Vendor'], 'Status': status, 'Match score (%)': score})
+                        scores = [r['Match score (%)'] for r in evidence_rows]
+                        per_vendor[vendor['Vendor']] = {'covered': set(covered), 'average': round(sum(scores)/len(scores),1) if scores else 0, 'evidence': evidence_rows, 'file': vendor['File']}
+                    # Rank vendors individually against the full baseline (or the
+                    # shared cross-vendor scope catalogue when no baseline is supplied).
+                    # This makes the primary and backup lists candidates to replace a
+                    # single global provider, rather than merely complementary vendors.
+                    ranked_vendors = sorted(
+                        per_vendor,
+                        key=lambda name: (
+                            len(per_vendor[name]['covered']) / max(len(scope_items), 1),
+                            per_vendor[name]['average'],
+                        ),
+                        reverse=True,
+                    )
+                    primary = ranked_vendors[:3]
+                    backups = ranked_vendors[3:6]
+                    st.subheader('Analysis overview')
+                    st.info(f'Mode: {analysis_mode}. Scope statements assessed: {len(scope_items)}. Vendors analyzed: {len(parsed_vendors)}.')
+                    k1,k2,k3,k4 = st.columns(4)
+                    k1.metric('Vendors analyzed', len(parsed_vendors))
+                    k2.metric('Scope statements', len(scope_items))
+                    k3.metric('Primary vendors', len(primary))
+                    k4.metric('Backup vendors', len(backups))
+                    coverage_rows=[]
+                    for name, detail in per_vendor.items():
+                        coverage_rows.append({'Vendor':name,'Coverage (%)':round(100*len(detail['covered'])/len(scope_items),1),'Average match (%)':detail['average'],'Covered scopes':len(detail['covered']),'Source file':detail['file']})
+                    coverage_frame=pd.DataFrame(coverage_rows).sort_values(['Coverage (%)','Average match (%)'],ascending=False)
+                    st.subheader('Vendor coverage graph')
+                    st.bar_chart(coverage_frame.set_index('Vendor')[['Coverage (%)','Average match (%)']], use_container_width=True)
+                    st.caption('Coverage counts scope statements classified Covered or Potential. Average match is lexical similarity. Treat both as screening metrics, not proof of contractual capability.')
+                    st.subheader('Recommended primary vendors')
+                    if primary:
+                        st.dataframe(coverage_frame[coverage_frame['Vendor'].isin(primary)].sort_values(['Coverage (%)','Average match (%)'],ascending=False), use_container_width=True, hide_index=True)
+                    else:
+                        st.warning('No primary set could be selected from the available scope statements.')
+                    st.subheader('Backup vendors')
+                    if backups:
+                        st.dataframe(coverage_frame[coverage_frame['Vendor'].isin(backups)].sort_values(['Coverage (%)','Average match (%)'],ascending=False), use_container_width=True, hide_index=True)
+                    else:
+                        st.write('No additional vendors are available as backups. Upload more vendor documents to identify backup options.')
+                    st.subheader('Scope-by-vendor comparison matrix')
+                    matrix = pd.DataFrame([{'Scope requirement':_sow_scope_label(scope)} for scope in scope_items])
+                    for name, detail in per_vendor.items():
+                        statuses = {row['Scope requirement']:row['Status'] for row in detail['evidence']}
+                        matrix[name] = [statuses.get(_sow_scope_label(scope),'Gap') for scope in scope_items]
+                    st.dataframe(matrix, use_container_width=True, hide_index=True)
+                    st.subheader('Detailed match evidence')
+                    evidence_frame = pd.DataFrame([row for detail in per_vendor.values() for row in detail['evidence']])
+                    status_filter = st.multiselect('Filter by match status', ['Covered','Potential','Gap'], default=['Covered','Potential','Gap'], key='sow_status_filter')
+                    st.dataframe(evidence_frame[evidence_frame['Status'].isin(status_filter)], use_container_width=True, hide_index=True)
+                    export_buffer = BytesIO()
+                    with pd.ExcelWriter(export_buffer, engine='openpyxl') as writer:
+                        coverage_frame.to_excel(writer, index=False, sheet_name='Vendor Summary')
+                        matrix.to_excel(writer, index=False, sheet_name='Scope Matrix')
+                        evidence_frame.to_excel(writer, index=False, sheet_name='Match Evidence')
+                        pd.DataFrame({'Primary vendors': primary + [''] * (3-len(primary)), 'Backup vendors': backups + [''] * (3-len(backups))}).to_excel(writer, index=False, sheet_name='Recommendations')
+                    st.download_button('Download SOW comparison workbook', data=export_buffer.getvalue(), file_name='Vendor_SOW_Analysis.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', use_container_width=True)
+                    st.warning('Before selecting vendors, validate each match against the complete SOW: exclusions, regions/countries, hours of coverage, response and resolution SLAs, onsite/remote coverage, dependencies, certifications, subcontracting, and commercial assumptions. The analyzer does not certify legal equivalence.')
+        except Exception:
+            st.error('The SOW documents could not be analyzed. Check that the files are readable and in a supported format.')
+    st.stop()
+
+st.markdown("""
+<style>
+.block-container {padding-top: 1.5rem; max-width: 1400px;}
+.hero {padding: 1.2rem 1.4rem; border-radius: 14px; background: linear-gradient(120deg,#006B4F,#008A69); color: white; margin-bottom: 1rem;}
+.hero h1 {color:white; margin:0;}
+.hero p {color:#e7fff6; margin:.35rem 0 0 0;}
+</style>
+<div class="hero">
+<h1>PDF Approval Stamp Tool</h1>
+<p>Extract Juniper GL details, validate approval totals, and stamp a separate copy of an invoice.</p>
+</div>
+""", unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("Processing rules")
@@ -1091,23 +1125,6 @@ with st.sidebar:
     else:
         stamp_placement = "Center in available blank space"
     st.caption("Region-specific validation rules are applied automatically.")
-    st.markdown("""
-    <style>
-    [class*="st-key-sow_tool_nav"] {position:fixed !important; bottom:18px !important; left:18px !important; width:250px !important; z-index:9999 !important;}
-    [class*="st-key-sow_tool_nav"] button {background:#006B4F !important;color:white !important;border:1px solid #008A69 !important;font-weight:700 !important;}
-    </style>
-    """, unsafe_allow_html=True)
-    if st.button("Vendor SOW Comparator", key="sow_tool_nav", use_container_width=True,
-                 help="Compare vendor SOW scope against a global vendor and rank primary / backup coverage"):
-        st.session_state["active_tool"] = "sow"
-        st.rerun()
-
-if st.session_state.get("active_tool") == "sow":
-    if st.button("← PDF Approval Stamp Tool", key="back_to_pdf_tool", use_container_width=True):
-        st.session_state["active_tool"] = "pdf"
-        st.rerun()
-    _sow_render_tool()
-    st.stop()
 
 if selected_region == "INDIA":
     st.subheader("India — NCR AP Upload CSV")
