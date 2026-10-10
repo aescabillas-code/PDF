@@ -581,3 +581,141 @@ if uploaded_pdf is not None:
     selected_position = page_labels.index(selected_page_label)
     page_index, page_text = candidate_pages[selected_position]
     extracted = extract_from_page(page_text, selected_region)
+
+    # Preserve the reference script's extraction behavior. If the selected page
+    # is only partially parsed, retry that same page with OCR before showing fields.
+    if not extracted.get("rows") or extracted.get("total") is None:
+        try:
+            _doc = pymupdf.open(stream=pdf_content, filetype="pdf")
+            try:
+                _ocr_text = _ocr_page(_doc[page_index])
+            finally:
+                _doc.close()
+            _ocr_extracted = extract_from_page(_ocr_text, selected_region)
+            if len(_ocr_extracted.get("rows", [])) > len(extracted.get("rows", [])) or (
+                _ocr_extracted.get("total") is not None and extracted.get("total") is None
+            ):
+                extracted = _ocr_extracted
+                page_text = _ocr_text
+                st.info("The selected page was re-read with OCR because the initial extraction was incomplete. Verify every value.")
+        except Exception:
+            pass
+
+    st.subheader("Extracted information")
+    st.caption(f"Selected summary page: {page_index + 1}")
+
+    if not extracted.get("rows"):
+        st.warning("No GL rows were extracted automatically. Enter the configured regional GL codes and amounts below.")
+
+    rows = extracted["rows"] or [{"Juniper GL Code": "", "Amount": None}]
+    editable_frame = pd.DataFrame(classify_rows(selected_region, rows))
+    edited_frame = st.data_editor(
+        editable_frame,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "Juniper GL Code": st.column_config.TextColumn("Juniper GL Code", required=True),
+            "Amount": st.column_config.NumberColumn("Amount", format="$%.2f", min_value=0.0),
+            "Classification": st.column_config.TextColumn("Classification", disabled=True),
+        },
+        key="gl_editor",
+    )
+
+    secret_approver_name, secret_approver_email = get_approval_defaults()
+    # Default approval date is the local date when extraction is generated.
+    # Allow the user to edit it if the actual approval date differs.
+    extraction_date = date.today().isoformat()
+
+    first, second, third = st.columns(3)
+    with first:
+        # Always derive the displayed total from the current GL rows when amounts
+        # are available, including after the user edits them.
+        amount_values = (
+            pd.to_numeric(edited_frame["Amount"], errors="coerce").dropna().tolist()
+            if "Amount" in edited_frame.columns else []
+        )
+        if amount_values:
+            default_total = round(sum(float(value) for value in amount_values), 2)
+        elif extracted["total"] is not None:
+            default_total = float(extracted["total"])
+        else:
+            default_total = 0.0
+        invoice_total = st.number_input(
+            "Total amount (sum of GL amounts)", min_value=0.0, value=default_total, step=0.01, format="%.2f"
+        )
+    with second:
+        approver_default = extracted["approver"] or secret_approver_name
+        approver_name = st.text_input("Approved by", value=approver_default, key="approved_by_input")
+    with third:
+        date_default = extraction_date
+        approval_date = st.text_input("Approval date (defaults to extraction date)", value=date_default, key="approval_date_input")
+    email_default = extracted["email"] or secret_approver_email
+    approver_email = st.text_input("Approver email", value=email_default, key="approver_email_input")
+
+    final_rows = []
+    for _, row in edited_frame.iterrows():
+        code = str(row.get("Juniper GL Code", "")).strip()
+        amount = row.get("Amount")
+        if code and amount is not None and str(amount).strip().lower() != "nan":
+            final_rows.append({"Juniper GL Code": code, "Amount": float(amount)})
+
+    classified_rows = classify_rows(selected_region, final_rows)
+    warnings = validate_rows(selected_region, classified_rows, invoice_total)
+    for warning in warnings:
+        st.warning(warning)
+    if not warnings:
+        st.success("Line amounts match the total. Review the stamp preview before processing.")
+
+    st.subheader("Stamp preview")
+    preview_lines = ["JUNIPER GL CODE                         AMOUNT"]
+    for row in final_rows:
+        preview_lines.append(f'{row["Juniper GL Code"]}    ${row["Amount"]:,.2f}')
+    preview_lines.append(f"TOTAL AMOUNT    ${invoice_total:,.2f}")
+    preview_lines += ["", f"Approved by {approver_name} {approval_date}".strip(), approver_email]
+    st.code("\n".join(preview_lines), language="text")
+
+    if st.button("Create stamped PDF", type="primary", use_container_width=True):
+        if not final_rows:
+            st.error("Add at least one GL code and amount before stamping.")
+        elif not approver_name.strip() or not approval_date.strip():
+            st.error("Approver name and approval date are required.")
+        elif warnings:
+            st.error("Resolve the validation warnings before stamping.")
+        else:
+            try:
+                result_pdf = stamp_pdf(
+                    pdf_content,
+                    page_index,
+                    final_rows,
+                    invoice_total,
+                    approver_name,
+                    approval_date,
+                    approver_email,
+                    stamp_placement,
+                )
+                original_name = uploaded_pdf.name
+                base_name = original_name[:-4] if original_name.lower().endswith(".pdf") else original_name
+                st.success("Stamped PDF is ready. Review the downloaded copy before using it.")
+                st.download_button(
+                    "Download stamped PDF",
+                    data=result_pdf,
+                    file_name=f"{base_name}_STAMPED.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            except ValueError:
+                st.error("There is not enough safe space for the stamp at the selected location.")
+            except Exception:
+                st.error("Stamping failed. Check that the PDF is valid and that the selected page is correct.")
+else:
+    st.info("Upload a supported regional invoice PDF to begin.")
+    st.markdown("""
+    **Workflow**
+    1. Select the invoice region.
+    2. Upload the PDF and select its summary page.
+    3. Review or correct the extracted GL codes and amounts.
+    4. Confirm the total, approver, date, and email.
+    5. Create and download the stamped PDF.
+
+    Uploaded content is processed in memory by this app; it does not intentionally write invoice data to local temporary files or logs.
+    """)
