@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import re
 import math
+import hashlib
+import zipfile
 from collections import Counter
 from typing import Optional
 from datetime import datetime
@@ -861,23 +863,38 @@ def stamp_pdf(
 # -----------------------------------------------------------------------------
 # Tool navigation and Vendor SOW Analyzer (kept separate from PDF stamping)
 # -----------------------------------------------------------------------------
-SOW_STOPWORDS = set("""a an and are as at be by for from has have in into is it of on or our that the their this to with will can may must should shall services service scope work works vendor supplier client customer global regional local support manage management provide provision including include includes across per via using use used related applicable requirements requirement deliver deliverables delivery activities activity responsibilities responsibility""".split())
+SOW_STOPWORDS = set("""a an and are as at be been being by for from has have had in into is it its of on or our that the their this to with will can may must should shall services service scope work works vendor supplier client customer global regional local support manage management provide provision including include includes across per via using use used related applicable requirements requirement deliver deliverables delivery activities activity responsibilities responsibility hereby hereunder thereto therein thereof pursuant agreement agreements party parties hpe hereby herein such any all each both other same respective said may also not no nor if then than where when while which who whom whose more most less very other however therefore section clause exhibit appendix attachment page number version date confidential proprietary company enterprise inc limited ltd gmbh private pte mexico japan india china anz apj naas non""".split())
+
+SOW_SUPPORTED_EXTS = {'.pdf', '.docx', '.docm', '.xlsx', '.xlsm', '.xls', '.pptx', '.txt', '.md', '.csv', '.zip'}
+SOW_MAX_ARCHIVE_DEPTH = 3
+SOW_MAX_DOCUMENTS = 100
+SOW_MAX_TOTAL_BYTES = 100 * 1024 * 1024
 
 
-def _sow_read_upload(uploaded):
-    """Read supported SOW/capability documents in memory; never write uploads to disk."""
-    name = uploaded.name
-    data = uploaded.getvalue()
-    suffix = name.rsplit('.', 1)[-1].lower() if '.' in name else ''
-    if suffix == 'pdf':
+def _sow_read_document(name, data):
+    """Read one supported SOW/capability document in memory only."""
+    suffix = ('.' + name.rsplit('.', 1)[-1].lower()) if '.' in name else ''
+    if suffix == '.pdf':
         doc = pymupdf.open(stream=data, filetype='pdf')
         try:
-            return '\n'.join(page.get_text('text') for page in doc)
+            pages = [page.get_text('text') for page in doc]
+            text_value = '\n'.join(pages)
+            # OCR is a fallback only for genuinely text-poor/scanned PDFs.
+            if len(text_value.strip()) < 100:
+                ocr_pages = []
+                for page in doc:
+                    try:
+                        ocr_pages.append(_ocr_page(page))
+                    except Exception:
+                        ocr_pages.append('')
+                if len('\n'.join(ocr_pages).strip()) > len(text_value.strip()):
+                    text_value = '\n'.join(ocr_pages)
+            return text_value
         finally:
             doc.close()
-    if suffix in ('txt', 'md', 'csv'):
-        return data.decode('utf-8', errors='replace')
-    if suffix in ('docx', 'docm'):
+    if suffix in ('.txt', '.md', '.csv'):
+        return data.decode('utf-8-sig', errors='replace')
+    if suffix in ('.docx', '.docm'):
         from docx import Document
         document = Document(BytesIO(data))
         parts = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
@@ -885,14 +902,14 @@ def _sow_read_upload(uploaded):
             for row in table.rows:
                 parts.append(' | '.join(cell.text.strip() for cell in row.cells))
         return '\n'.join(parts)
-    if suffix in ('xlsx', 'xlsm', 'xls'):
+    if suffix in ('.xlsx', '.xlsm', '.xls'):
         sheets = pd.read_excel(BytesIO(data), sheet_name=None, dtype=str)
         parts = []
         for sheet_name, frame in sheets.items():
             parts.append(f'SHEET: {sheet_name}')
             parts.append(frame.fillna('').astype(str).to_csv(index=False))
         return '\n'.join(parts)
-    if suffix == 'pptx':
+    if suffix == '.pptx':
         from pptx import Presentation
         presentation = Presentation(BytesIO(data))
         parts = []
@@ -907,14 +924,86 @@ def _sow_read_upload(uploaded):
     raise ValueError('Unsupported document format')
 
 
+def _sow_expand_uploads(uploads):
+    """Expand supported documents and nested ZIPs in memory, deduplicating exact copies."""
+    expanded = []
+    seen_hashes = set()
+    total_bytes = 0
+
+    def add_document(name, data, depth=0):
+        nonlocal total_bytes
+        if len(expanded) >= SOW_MAX_DOCUMENTS:
+            raise ValueError('The upload contains too many documents. Limit the batch to 100 documents.')
+        suffix = ('.' + name.rsplit('.', 1)[-1].lower()) if '.' in name else ''
+        if suffix == '.zip':
+            if depth >= SOW_MAX_ARCHIVE_DEPTH:
+                return
+            try:
+                with zipfile.ZipFile(BytesIO(data)) as archive:
+                    for item in archive.infolist():
+                        if item.is_dir():
+                            continue
+                        inner_name = item.filename.replace('\\', '/').split('/')[-1]
+                        inner_suffix = ('.' + inner_name.rsplit('.', 1)[-1].lower()) if '.' in inner_name else ''
+                        if inner_suffix not in SOW_SUPPORTED_EXTS:
+                            continue
+                        if item.file_size > SOW_MAX_TOTAL_BYTES or total_bytes + item.file_size > SOW_MAX_TOTAL_BYTES:
+                            raise ValueError('The expanded upload exceeds the 100 MB processing limit.')
+                        with archive.open(item) as handle:
+                            inner_data = handle.read(SOW_MAX_TOTAL_BYTES + 1)
+                        if len(inner_data) > SOW_MAX_TOTAL_BYTES:
+                            raise ValueError('A document in the archive exceeds the processing limit.')
+                        add_document(f'{name} / {inner_name}', inner_data, depth + 1)
+            except zipfile.BadZipFile:
+                return
+            return
+        if suffix not in SOW_SUPPORTED_EXTS:
+            return
+        digest = hashlib.sha256(data).hexdigest()
+        if digest in seen_hashes:
+            return
+        seen_hashes.add(digest)
+        total_bytes += len(data)
+        if total_bytes > SOW_MAX_TOTAL_BYTES:
+            raise ValueError('The expanded upload exceeds the 100 MB processing limit.')
+        text_value = _sow_read_document(name, data)
+        if text_value and text_value.strip():
+            expanded.append({'File': name, 'Text': text_value, 'SHA256': digest})
+
+    for uploaded in uploads or []:
+        add_document(uploaded.name, uploaded.getvalue())
+    return expanded
+
+
+def _sow_read_upload(uploaded):
+    """Backward-compatible reader for a single document or ZIP archive."""
+    docs = _sow_expand_uploads([uploaded])
+    return '\n\n'.join(f"DOCUMENT: {item['File']}\n{item['Text']}" for item in docs)
+
+
 def _sow_normalize(text):
     return re.sub(r'[^a-z0-9]+', ' ', (text or '').lower()).strip()
 
 
 def _sow_sentences(text):
-    text = re.sub(r'\s+', ' ', text or '')
-    pieces = re.split(r'(?<=[.!?;])\s+|\n+', text)
-    return [piece.strip(' \t-•*') for piece in pieces if len(piece.strip()) >= 18]
+    """Extract line-level clauses while discarding page furniture and contents leaders."""
+    text = (text or '').replace('\r', '\n')
+    pieces = []
+    for raw_line in text.split('\n'):
+        line = re.sub(r'[ \t\f\v]+', ' ', raw_line).strip(' \t-•*▪◦\uf0b7')
+        if not line or len(line) < 24:
+            continue
+        if line.isupper() and len(line.split()) < 14:
+            continue
+        if re.search(r'\.{4,}|…{3,}|_{5,}', line):
+            continue
+        if re.fullmatch(r'(?:page\s*)?\d+(?:\s+of\s+\d+)?', line, re.I):
+            continue
+        if re.search(r'(?i)^(?:statement of work|hewlett packard enterprise confidential|confidentiality notice|important confidentiality notice|document history|revision history|table of contents|contents|docusign envelope id)', line):
+            continue
+        split_parts = re.split(r'(?<=[.!?;])\s+(?=[A-Z0-9(])', line)
+        pieces.extend(part.strip(' \t-•*▪◦\uf0b7') for part in split_parts if len(part.strip()) >= 24)
+    return pieces
 
 
 def _sow_terms(text, limit=120):
@@ -923,15 +1012,50 @@ def _sow_terms(text, limit=120):
     return [word for word, _ in counts.most_common(limit)]
 
 
-def _sow_extract_scope(text, limit=80):
+def _sow_extract_scope(text, limit=240):
+    """Prioritize operational scope, capability, coverage, SLA, and deliverable clauses."""
     sentences = _sow_sentences(text)
     if not sentences:
         return []
-    action_terms = ('provide', 'support', 'manage', 'maintain', 'monitor', 'deliver', 'install', 'repair', 'operate', 'service', 'deploy', 'configure', 'resolve', 'respond', 'process', 'administer', 'coordinate', 'review', 'assess', 'implement', 'upgrade', 'replace', 'dispatch', 'onsite', 'on-site', 'remote', '24/7', '24x7', 'sla', 'coverage')
-    selected = [s for s in sentences if any(term in s.lower() for term in action_terms)]
-    # If a document is mostly tables or terse bullet points, keep meaningful lines too.
-    if len(selected) < min(8, len(sentences)):
-        selected.extend(s for s in sentences if s not in selected and len(s.split()) >= 5)
+    action_terms = (
+        'provide onsite', 'onsite services', 'on-site services', 'break-fix', 'break fix',
+        'hardware replacement', 'replace hardware', 'parts replacement', 'troubleshooting',
+        'technical support', 'remote support', 'field service', 'field services', 'logistics',
+        'case management', 'parts management', 'customer service', 'incident management',
+        'service level', 'service levels', 'response time', 'resolution time', 'customer sla',
+        '24/7', '24x7', '9x5', 'business hours', 'service coverage', 'geographies in scope',
+        'countries in scope', 'country coverage', 'dispatch', 'work order', 'spare parts',
+        'inventory', 'shipment', 'warehouse', 'installation', 'maintenance', 'repair',
+        'escalation', 'ticket', 'incident', 'deliverable', 'weekly status report', 'sla report',
+        'end-to-end', 'e2e', 'project manager', 'project management', 'service improvement',
+        'monitor and update', 'customer updates', 'onsite support', 'technical assistance',
+        'administrative support', 'supply chain', 'customer contact', 'service request',
+        'hardware remediation', 'smart hands', 'configuration', 'network cabling',
+        'response and repair', 'service area', 'language coverage', 'support model'
+    )
+    boilerplate_terms = (
+        'confidentiality notice', 'confidential and proprietary', 'table of contents', 'document history',
+        'revision history', 'docusign envelope', 'all rights reserved', 'governed by the laws',
+        'limitation of liability', 'indirect or consequential damages', 'counterparts and signatures',
+        'this document is the property', 'intentionally left blank', 'signature page',
+        'agreement shall be governed', 'terms and conditions', 'copyright', 'not to be disclosed',
+        'not to be duplicated', 'intellectual property', 'force majeure', 'indemnify and hold harmless',
+        'employee of supplier', 'dressed in a manner', 'professional and lawful manner',
+        'shall be governed by', 'without the express written authorization', 'shall exercise the same degree'
+    )
+    selected = []
+    for sentence in sentences:
+        lower = sentence.lower()
+        normalized = _sow_normalize(sentence)
+        if any(term in lower for term in boilerplate_terms):
+            continue
+        if len(normalized.split()) < 7:
+            continue
+        if not any(term in lower for term in action_terms):
+            continue
+        selected.append(sentence)
+    if not selected:
+        selected = [s for s in sentences if len(s.split()) >= 8 and not any(t in s.lower() for t in boilerplate_terms)]
     unique, seen = [], set()
     for sentence in selected:
         key = _sow_normalize(sentence)
@@ -944,20 +1068,140 @@ def _sow_extract_scope(text, limit=80):
 
 
 def _sow_similarity(scope, vendor_text):
-    """Conservative lexical similarity with explicit evidence, not a legal conclusion."""
-    a = set(_sow_terms(scope, 500))
-    b = set(_sow_terms(vendor_text, 1200))
-    if not a:
+    """Score the best clause-level match instead of comparing against whole-document boilerplate."""
+    target = set(_sow_terms(scope, 500))
+    if not target:
         return 0.0, []
-    overlap = a & b
-    # Recall-like measure prioritizes whether the vendor document mentions required scope.
-    score = 100 * len(overlap) / len(a)
-    return round(min(score, 100), 1), sorted(overlap)
+    candidates = list(vendor_text) if isinstance(vendor_text, (list, tuple, set)) else _sow_extract_scope(vendor_text, limit=240)
+    best_score, best_terms = 0.0, []
+    for candidate in candidates:
+        tokens = set(_sow_terms(candidate, 500))
+        overlap = target & tokens
+        if len(overlap) < min(2, len(target)):
+            continue
+        recall = len(overlap) / max(len(target), 1)
+        precision = len(overlap) / max(len(tokens), 1)
+        score = 100 * (0.75 * recall + 0.25 * precision)
+        if score > best_score:
+            best_score, best_terms = score, sorted(overlap)
+    return round(min(best_score, 100), 1), best_terms
 
 
 def _sow_scope_label(sentence):
     cleaned = re.sub(r'\s+', ' ', sentence).strip()
     return cleaned[:180] + ('…' if len(cleaned) > 180 else '')
+
+
+def _sow_infer_vendor(name, text):
+    """Infer a legal supplier name when stated; otherwise clearly mark it as unidentified."""
+    source = (text or '').replace('\r', '\n')
+    known_entity_patterns = [
+        r'(?i)Hemmersbach Worldwide GmbH', r'(?i)EXEO GLOBAL PTE\.? LTD\.?',
+        r'(?i)Cygnet IT Services Private Limited', r'(?i)ARCO Japan,? Inc\.?',
+        r'(?i)ARA Technologies trading as AWA Technology Services',
+        r'(?i)Beijing Huayuweicheng Technology Service Co\.?\s*,?\s*Ltd\.?',
+        r'(?i)Smartlog Mexico S\.?A\.? de C\.?V\.?',
+    ]
+    for pattern in known_entity_patterns:
+        match = re.search(pattern, source)
+        if match:
+            value = re.sub(r'\s+', ' ', match.group(0)).strip(' .;:-')
+            if value.lower().startswith('ara technologies'):
+                return 'ARA Technologies Pty Limited (AWA Technology Services)'
+            if value.lower().startswith('smartlog'):
+                return 'Smartlog Mexico SA de CV'
+            if value.lower().startswith('beijing'):
+                return 'Beijing Huayuweicheng Technology Service Co., Ltd.'
+            return value
+    candidates = re.findall(r'(?im)^\s*(?:supplier(?:\s+name)?|subcontractor|proveedor)\s*:\s*([^\n\r|]{2,160})', source)
+    for candidate in candidates:
+        value = re.sub(r'\s+', ' ', candidate).strip(' .;:-')
+        if not value or re.fullmatch(r'[_\- .]+', value) or 'project manager' in value.lower():
+            continue
+        if len(value) >= 3 and not value.lower().startswith(('please insert', 'to be completed', 'name and title')):
+            return value
+    stem = re.sub(r'\.(pdf|docx|docm|xlsx|xlsm|xls|pptx|txt|md|csv|zip)$', '', name.rsplit('/', 1)[-1], flags=re.I)
+    stem = re.sub(r'^(?:SOW\s*)', '', stem, flags=re.I).strip(' _-')
+    return f'Unidentified supplier — {stem or "uploaded document"}'
+
+
+def _sow_detect_coverage_area(file_names, text=''):
+    """Return only geographic labels supported by the document title."""
+    labels = []
+    for name in file_names if isinstance(file_names, (list, tuple, set)) else [file_names]:
+        value = re.sub(r'[^a-z0-9]+', ' ', str(name).lower())
+        if re.search(r'\banz\b|australia.{0,8}new zealand', value):
+            label = 'Australia & New Zealand (ANZ)'
+        elif re.search(r'\bapj\b|asia pacific', value):
+            label = 'Asia Pacific (APJ)'
+        elif re.search(r'\bchina\b', value):
+            label = 'China'
+        elif re.search(r'\bindia\b', value):
+            label = 'India'
+        elif re.search(r'\bjapan\b', value):
+            label = 'Japan'
+        else:
+            label = ''
+        if label and label not in labels:
+            labels.append(label)
+    return '; '.join(labels) if labels else 'Not established from document title'
+
+
+def _sow_cluster_scope_items(scope_records, threshold=0.62, limit=180):
+    """Cluster near-duplicate scope clauses into a balanced shared comparison catalogue."""
+    clusters = []
+    for record in scope_records:
+        sentence = record['scope']
+        tokens = set(_sow_terms(sentence, 500))
+        if len(tokens) < 3:
+            continue
+        best_idx, best_similarity = None, 0.0
+        for idx, cluster in enumerate(clusters):
+            overlap = tokens & cluster['tokens']
+            union = tokens | cluster['tokens']
+            jaccard = len(overlap) / max(len(union), 1)
+            containment = len(overlap) / max(min(len(tokens), len(cluster['tokens'])), 1)
+            similarity = max(jaccard, containment * 0.82)
+            if len(overlap) >= 4 and similarity > best_similarity:
+                best_idx, best_similarity = idx, similarity
+        if best_idx is not None and best_similarity >= threshold:
+            cluster = clusters[best_idx]
+            cluster['sources'].add(record['vendor'])
+            cluster['variants'].append(sentence)
+            if len(sentence) > len(cluster['scope']):
+                cluster['scope'] = sentence
+                cluster['tokens'] = tokens
+        else:
+            clusters.append({'scope': sentence, 'tokens': tokens, 'sources': {record['vendor']}, 'variants': [sentence]})
+    # Include common clauses and a balanced sample of vendor-specific clauses, not just the first file's clauses.
+    common = [c for c in clusters if len(c['sources']) > 1]
+    unique = [c for c in clusters if len(c['sources']) == 1]
+    common.sort(key=lambda c: (len(c['sources']), len(c['tokens']), len(c['scope'])), reverse=True)
+    unique_by_vendor = {}
+    for cluster in unique:
+        vendor_key = next(iter(cluster['sources']))
+        unique_by_vendor.setdefault(vendor_key, []).append(cluster)
+    for vendor_key in unique_by_vendor:
+        unique_by_vendor[vendor_key].sort(key=lambda c: (len(c['tokens']), len(c['scope'])), reverse=True)
+    balanced_unique = []
+    vendor_keys = sorted(unique_by_vendor)
+    while vendor_keys:
+        remaining_keys = []
+        for vendor_key in vendor_keys:
+            bucket = unique_by_vendor[vendor_key]
+            if bucket:
+                balanced_unique.append(bucket.pop(0))
+            if bucket:
+                remaining_keys.append(vendor_key)
+        vendor_keys = remaining_keys
+    common_slots = min(len(common), int(limit * 0.60))
+    unique_slots = min(len(balanced_unique), limit - common_slots)
+    selected = common[:common_slots] + balanced_unique[:unique_slots]
+    if len(selected) < limit:
+        selected_ids = {id(item) for item in selected}
+        fill = [item for item in common[common_slots:] + balanced_unique[unique_slots:] if id(item) not in selected_ids]
+        selected.extend(fill[:limit - len(selected)])
+    return [{'scope': c['scope'], 'sources': sorted(c['sources']), 'variants': c['variants']} for c in selected]
 
 
 # Navigation controls are fixed at the bottom-left of the sidebar. The active tool
@@ -1023,116 +1267,221 @@ if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
     st.caption('Upload a global SOW as the target scope when available, plus vendor SOWs and capability documents. If no baseline is available, the analyzer identifies common and complementary work across vendors. Files are read in memory.')
     with st.expander('How the recommendations work', expanded=False):
         st.write('The analyzer extracts text and compares scope terms and evidence statements. It recommends a set of up to 3 primary vendors and up to 3 backups using a coverage-first selection. Similarity is a screening aid, not a contractual determination; verify exclusions, geography, SLAs, staffing, certifications, and commercial terms in the source documents.')
-    baseline_file = st.file_uploader('Global vendor SOW / baseline (optional)', type=['pdf','docx','docm','xlsx','xlsm','xls','pptx','txt','md','csv'], key='sow_baseline')
-    vendor_files = st.file_uploader('Upload vendor SOWs and capability documents', type=['pdf','docx','docm','xlsx','xlsm','xls','pptx','txt','md','csv'], accept_multiple_files=True, key='sow_vendor_files')
+    _sow_file_types = ['pdf','docx','docm','xlsx','xlsm','xls','pptx','txt','md','csv','zip']
+    baseline_file = st.file_uploader('Global vendor SOW / baseline (optional)', type=_sow_file_types, key='sow_baseline')
+    vendor_files = st.file_uploader('Upload vendor SOWs, capability documents, or a ZIP containing multiple documents', type=_sow_file_types, accept_multiple_files=True, key='sow_vendor_files')
+    st.caption('ZIP archives (including nested ZIPs) are expanded in memory. Exact duplicate files are removed. Documents with no detectable supplier are kept separate and clearly labeled for manual review.')
+
     if st.button('Analyze vendor scope', type='primary', use_container_width=True, key='run_sow_analysis'):
         try:
+            parsed_docs = _sow_expand_uploads(vendor_files or [])
+            parsed_vendors_by_key = {}
+            excluded_documents = []
+            for document in parsed_docs:
+                text_value = document['Text']
+                base_name = document['File'].rsplit('/', 1)[-1]
+                lower_name = base_name.lower()
+                if ('gp_manual' in lower_name or 'shift resume' in lower_name or 'staff roster' in lower_name or 'summary english' in lower_name):
+                    excluded_documents.append({'File': document['File'], 'Reason': 'Reference, summary, or staffing document; not counted as a separate vendor.'})
+                    continue
+                scope_lines = _sow_extract_scope(text_value)
+                if not scope_lines:
+                    excluded_documents.append({'File': document['File'], 'Reason': 'No usable operational scope clauses were detected.'})
+                    continue
+                vendor_name = _sow_infer_vendor(document['File'], text_value)
+                vendor_key = _sow_normalize(vendor_name)
+                if vendor_key not in parsed_vendors_by_key:
+                    parsed_vendors_by_key[vendor_key] = {'Vendor': vendor_name, 'Files': [], 'Texts': [], 'Scopes': [], 'Hashes': set()}
+                grouped = parsed_vendors_by_key[vendor_key]
+                grouped['Files'].append(document['File'])
+                grouped['Texts'].append(text_value)
+                grouped['Scopes'].extend(scope_lines)
+                grouped['Hashes'].add(document['SHA256'])
+
             parsed_vendors = []
-            for uploaded in vendor_files or []:
-                text_value = _sow_read_upload(uploaded)
-                if text_value.strip():
-                    parsed_vendors.append({'Vendor': uploaded.name.rsplit('.',1)[0], 'File': uploaded.name, 'Text': text_value, 'Scopes': _sow_extract_scope(text_value)})
-            baseline_text = _sow_read_upload(baseline_file) if baseline_file is not None else ''
+            for grouped in parsed_vendors_by_key.values():
+                unique_scopes, seen_scopes = [], set()
+                for scope in grouped['Scopes']:
+                    key = _sow_normalize(scope)
+                    if key and key not in seen_scopes:
+                        seen_scopes.add(key)
+                        unique_scopes.append(scope)
+                parsed_vendors.append({
+                    'Vendor': grouped['Vendor'],
+                    'File': '; '.join(grouped['Files']),
+                    'Files': grouped['Files'],
+                    'Text': '\n\n'.join(grouped['Texts']),
+                    'Scopes': unique_scopes,
+                    'Coverage area': _sow_detect_coverage_area(grouped['Files'], '\n'.join(grouped['Texts'])),
+                })
+
+            baseline_docs = _sow_expand_uploads([baseline_file]) if baseline_file is not None else []
+            baseline_text = '\n\n'.join(item['Text'] for item in baseline_docs)
             baseline_scopes = _sow_extract_scope(baseline_text) if baseline_text.strip() else []
             if len(parsed_vendors) < 2:
-                st.error('Upload at least two readable vendor SOW/capability documents to compare scope.')
+                st.error('Upload at least two distinct vendor SOWs/capability documents. Exact duplicates are removed and documents with the same detected supplier are grouped together.')
             else:
-                # Baseline mode compares every vendor against baseline scope statements.
-                # No-baseline mode builds a shared scope catalogue from the combined vendor documents.
                 if baseline_scopes:
-                    scope_items = baseline_scopes
+                    baseline_records = [{'vendor': 'Global baseline', 'scope': scope} for scope in baseline_scopes]
+                    clustered = _sow_cluster_scope_items(baseline_records, threshold=0.74, limit=180)
+                    scope_items = [item['scope'] for item in clustered]
+                    scope_sources = [set() for _ in scope_items]
                     analysis_mode = 'Global baseline comparison'
                 else:
-                    combined = []
-                    seen_scope = set()
-                    for vendor in parsed_vendors:
-                        for scope in vendor['Scopes']:
-                            normalized = _sow_normalize(scope)
-                            if normalized and normalized not in seen_scope:
-                                seen_scope.add(normalized)
-                                combined.append(scope)
-                    scope_items = combined[:120]
+                    scope_records = [{'vendor': vendor['Vendor'], 'scope': scope} for vendor in parsed_vendors for scope in vendor['Scopes']]
+                    clustered = _sow_cluster_scope_items(scope_records, threshold=0.74, limit=180)
+                    scope_items = [item['scope'] for item in clustered]
+                    scope_sources = [set(item['sources']) for item in clustered]
                     analysis_mode = 'Cross-vendor overlap (no global baseline)'
+
                 if not scope_items:
-                    st.error('No usable scope statements were detected. Upload text-based documents or documents with selectable text.')
+                    st.error('No usable scope statements were detected. Upload readable SOWs or capability documents with selectable text.')
                 else:
-                    matrix_rows = []
                     per_vendor = {}
+                    all_evidence_rows = []
                     for vendor in parsed_vendors:
-                        covered = []
-                        evidence_rows = []
-                        vendor_norm = _sow_normalize(vendor['Text'])
+                        covered, potential, evidence_rows = set(), set(), []
                         for i, scope in enumerate(scope_items):
-                            score, terms = _sow_similarity(scope, vendor['Text'])
-                            # Exact normalized phrase match or high lexical overlap raises confidence.
+                            score, terms = _sow_similarity(scope, vendor['Scopes'])
                             phrase = _sow_normalize(scope)
+                            vendor_norm = _sow_normalize(vendor['Text'])
                             phrase_present = bool(phrase and phrase in vendor_norm)
-                            status = 'Covered' if phrase_present or score >= 55 else ('Potential' if score >= 25 else 'Gap')
-                            if status != 'Gap':
-                                covered.append(i)
-                            evidence = next((line for line in vendor['Scopes'] if (phrase and phrase in _sow_normalize(line)) or (len(set(_sow_terms(scope, 40)) & set(_sow_terms(line, 100))) >= 3)), '')
-                            evidence_rows.append({'Scope requirement': _sow_scope_label(scope), 'Vendor': vendor['Vendor'], 'Status': status, 'Match score (%)': score, 'Matched terms': ', '.join(terms[:12]), 'Evidence excerpt': (evidence or 'No close excerpt found; manually review source document.')[:350]})
-                            matrix_rows.append({'Scope requirement': _sow_scope_label(scope), 'Vendor': vendor['Vendor'], 'Status': status, 'Match score (%)': score})
+                            if vendor['Vendor'] in scope_sources[i]:
+                                status, score = 'Covered', max(score, 100.0)
+                            else:
+                                status = 'Covered' if phrase_present or score >= 60 else ('Potential' if score >= 30 else 'Gap')
+                            if status == 'Covered':
+                                covered.add(i)
+                            elif status == 'Potential':
+                                potential.add(i)
+                            evidence = ''
+                            if vendor['Scopes']:
+                                best_score = -1
+                                for candidate_line in vendor['Scopes']:
+                                    candidate_score, _ = _sow_similarity(scope, [candidate_line])
+                                    if candidate_score > best_score:
+                                        best_score, evidence = candidate_score, candidate_line
+                            if not evidence or status == 'Gap':
+                                evidence = 'No close scope excerpt found; manually review the source document.'
+                            evidence_rows.append({
+                                'Scope requirement': _sow_scope_label(scope),
+                                'Vendor': vendor['Vendor'],
+                                'Status': status,
+                                'Match score (%)': score,
+                                'Matched terms': ', '.join(terms[:12]),
+                                'Evidence excerpt': evidence[:500],
+                                'Source document(s)': vendor['File'],
+                            })
+                        n = max(len(scope_items), 1)
+                        weighted_coverage = round((len(covered) + 0.5 * len(potential)) / n * 100, 1)
                         scores = [r['Match score (%)'] for r in evidence_rows]
-                        per_vendor[vendor['Vendor']] = {'covered': set(covered), 'average': round(sum(scores)/len(scores),1) if scores else 0, 'evidence': evidence_rows, 'file': vendor['File']}
-                    # Rank vendors individually against the full baseline (or the
-                    # shared cross-vendor scope catalogue when no baseline is supplied).
-                    # This makes the primary and backup lists candidates to replace a
-                    # single global provider, rather than merely complementary vendors.
+                        per_vendor[vendor['Vendor']] = {
+                            'covered': covered,
+                            'potential': potential,
+                            'weighted_coverage': weighted_coverage,
+                            'average': round(sum(scores) / len(scores), 1) if scores else 0,
+                            'evidence': evidence_rows,
+                            'file': vendor['File'],
+                            'scope_count': len(vendor['Scopes']),
+                            'coverage_area': vendor.get('Coverage area', 'Not established from document title'),
+                        }
+                        all_evidence_rows.extend(evidence_rows)
+
                     ranked_vendors = sorted(
                         per_vendor,
                         key=lambda name: (
-                            len(per_vendor[name]['covered']) / max(len(scope_items), 1),
+                            per_vendor[name]['weighted_coverage'],
+                            len(per_vendor[name]['covered']),
                             per_vendor[name]['average'],
+                            -len(per_vendor[name]['potential']),
                         ),
                         reverse=True,
                     )
                     primary = ranked_vendors[:3]
                     backups = ranked_vendors[3:6]
                     st.subheader('Analysis overview')
-                    st.info(f'Mode: {analysis_mode}. Scope statements assessed: {len(scope_items)}. Vendors analyzed: {len(parsed_vendors)}.')
-                    k1,k2,k3,k4 = st.columns(4)
-                    k1.metric('Vendors analyzed', len(parsed_vendors))
-                    k2.metric('Scope statements', len(scope_items))
-                    k3.metric('Primary vendors', len(primary))
-                    k4.metric('Backup vendors', len(backups))
-                    coverage_rows=[]
+                    st.info(f'Mode: {analysis_mode}. Distinct scope clauses assessed: {len(scope_items)}. Distinct supplier groups analyzed: {len(parsed_vendors)}. Exact duplicate files are excluded from the count.')
+                    if not baseline_scopes:
+                        st.warning('No global baseline was supplied. This mode measures overlap across the uploaded scope documents; it cannot prove that any single vendor can replace a global provider. Geographic coverage is shown separately and must be validated before treating a candidate as global.')
+                    if any(name.startswith('Unidentified supplier') for name in per_vendor):
+                        st.warning('One or more documents did not identify a legal supplier. These are labeled by document name and may represent a region/template rather than an independent vendor. Verify the supplier identity before using the shortlist.')
+                    if len(parsed_vendors) < 6:
+                        st.warning(f'Only {len(parsed_vendors)} distinct supplier group(s) were identified. The analyzer can recommend up to {len(primary)} primary and {len(backups)} backup candidates; upload additional independent vendor SOWs to reach six.')
+                    if excluded_documents:
+                        with st.expander(f'Reference/admin documents excluded from vendor ranking ({len(excluded_documents)})', expanded=False):
+                            st.dataframe(pd.DataFrame(excluded_documents), use_container_width=True, hide_index=True)
+
+                    k1, k2, k3, k4 = st.columns(4)
+                    k1.metric('Distinct vendors/groups', len(parsed_vendors))
+                    k2.metric('Scope clusters', len(scope_items))
+                    k3.metric('Primary candidates', len(primary))
+                    k4.metric('Backup candidates', len(backups))
+
+                    coverage_rows = []
                     for name, detail in per_vendor.items():
-                        coverage_rows.append({'Vendor':name,'Coverage (%)':round(100*len(detail['covered'])/len(scope_items),1),'Average match (%)':detail['average'],'Covered scopes':len(detail['covered']),'Source file':detail['file']})
-                    coverage_frame=pd.DataFrame(coverage_rows).sort_values(['Coverage (%)','Average match (%)'],ascending=False)
+                        n = max(len(scope_items), 1)
+                        coverage_rows.append({
+                            'Vendor / supplier group': name,
+                            'Coverage area (from document title)': detail['coverage_area'],
+                            'Global coverage evidence': ('Not evidenced — region-specific SOW' if detail['coverage_area'] != 'Not established from document title' else 'Not established; manual verification required'),
+                            'Weighted coverage (%)': detail['weighted_coverage'],
+                            'Confirmed covered (%)': round(100 * len(detail['covered']) / n, 1),
+                            'Potential (%)': round(100 * len(detail['potential']) / n, 1),
+                            'Average match (%)': detail['average'],
+                            'Covered scopes': len(detail['covered']),
+                            'Potential scopes': len(detail['potential']),
+                            'Gap scopes': n - len(detail['covered']) - len(detail['potential']),
+                            'Documents grouped': len(detail['file'].split('; ')),
+                            'Source file(s)': detail['file'],
+                        })
+                    coverage_frame = pd.DataFrame(coverage_rows).sort_values(
+                        ['Weighted coverage (%)', 'Confirmed covered (%)', 'Average match (%)'], ascending=False
+                    )
                     st.subheader('Vendor coverage graph')
-                    st.bar_chart(coverage_frame.set_index('Vendor')[['Coverage (%)','Average match (%)']], use_container_width=True)
-                    st.caption('Coverage counts scope statements classified Covered or Potential. Average match is lexical similarity. Treat both as screening metrics, not proof of contractual capability.')
+                    st.bar_chart(coverage_frame.set_index('Vendor / supplier group')[['Weighted coverage (%)', 'Confirmed covered (%)', 'Potential (%)']], use_container_width=True)
+                    st.caption('Weighted coverage counts each Covered scope as 1 and each Potential scope as 0.5. Confirmed and Potential are shown separately to avoid presenting uncertain matches as proven coverage. Geographic labels are inferred from document titles only; they are not proof of complete country coverage. Similarity is evidence screening, not a contractual conclusion.')
+
                     st.subheader('Recommended primary vendors')
                     if primary:
-                        st.dataframe(coverage_frame[coverage_frame['Vendor'].isin(primary)].sort_values(['Coverage (%)','Average match (%)'],ascending=False), use_container_width=True, hide_index=True)
+                        st.dataframe(coverage_frame[coverage_frame['Vendor / supplier group'].isin(primary)], use_container_width=True, hide_index=True)
                     else:
-                        st.warning('No primary set could be selected from the available scope statements.')
+                        st.warning('No primary candidates could be selected from the available scope statements.')
                     st.subheader('Backup vendors')
                     if backups:
-                        st.dataframe(coverage_frame[coverage_frame['Vendor'].isin(backups)].sort_values(['Coverage (%)','Average match (%)'],ascending=False), use_container_width=True, hide_index=True)
+                        st.dataframe(coverage_frame[coverage_frame['Vendor / supplier group'].isin(backups)], use_container_width=True, hide_index=True)
                     else:
-                        st.write('No additional vendors are available as backups. Upload more vendor documents to identify backup options.')
+                        st.write('No additional distinct vendor groups are available as backups. Upload more independent vendor documents to identify backup options.')
+
                     st.subheader('Scope-by-vendor comparison matrix')
-                    matrix = pd.DataFrame([{'Scope requirement':_sow_scope_label(scope)} for scope in scope_items])
+                    matrix = pd.DataFrame([{'Scope requirement': _sow_scope_label(scope)} for scope in scope_items])
                     for name, detail in per_vendor.items():
-                        statuses = {row['Scope requirement']:row['Status'] for row in detail['evidence']}
-                        matrix[name] = [statuses.get(_sow_scope_label(scope),'Gap') for scope in scope_items]
+                        statuses = {row['Scope requirement']: row['Status'] for row in detail['evidence']}
+                        matrix[name] = [statuses.get(_sow_scope_label(scope), 'Gap') for scope in scope_items]
                     st.dataframe(matrix, use_container_width=True, hide_index=True)
+
                     st.subheader('Detailed match evidence')
-                    evidence_frame = pd.DataFrame([row for detail in per_vendor.values() for row in detail['evidence']])
-                    status_filter = st.multiselect('Filter by match status', ['Covered','Potential','Gap'], default=['Covered','Potential','Gap'], key='sow_status_filter')
+                    evidence_frame = pd.DataFrame(all_evidence_rows)
+                    status_filter = st.multiselect('Filter by match status', ['Covered', 'Potential', 'Gap'], default=['Covered', 'Potential', 'Gap'], key='sow_status_filter')
                     st.dataframe(evidence_frame[evidence_frame['Status'].isin(status_filter)], use_container_width=True, hide_index=True)
+
+                    document_inventory = pd.DataFrame([
+                        {'Document': document['File'], 'Characters extracted': len(document['Text']), 'Scope clauses detected': len(_sow_extract_scope(document['Text'])), 'Supplier detected': _sow_infer_vendor(document['File'], document['Text']), 'Coverage area (from title)': _sow_detect_coverage_area([document['File']], document['Text'])}
+                        for document in parsed_docs
+                    ])
                     export_buffer = BytesIO()
                     with pd.ExcelWriter(export_buffer, engine='openpyxl') as writer:
                         coverage_frame.to_excel(writer, index=False, sheet_name='Vendor Summary')
                         matrix.to_excel(writer, index=False, sheet_name='Scope Matrix')
                         evidence_frame.to_excel(writer, index=False, sheet_name='Match Evidence')
-                        pd.DataFrame({'Primary vendors': primary + [''] * (3-len(primary)), 'Backup vendors': backups + [''] * (3-len(backups))}).to_excel(writer, index=False, sheet_name='Recommendations')
+                        document_inventory.to_excel(writer, index=False, sheet_name='Document Inventory')
+                        pd.DataFrame({
+                            'Primary vendors': primary + [''] * (3 - len(primary)),
+                            'Backup vendors': backups + [''] * (3 - len(backups)),
+                        }).to_excel(writer, index=False, sheet_name='Recommendations')
                     st.download_button('Download SOW comparison workbook', data=export_buffer.getvalue(), file_name='Vendor_SOW_Analysis.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', use_container_width=True)
-                    st.warning('Before selecting vendors, validate each match against the complete SOW: exclusions, regions/countries, hours of coverage, response and resolution SLAs, onsite/remote coverage, dependencies, certifications, subcontracting, and commercial assumptions. The analyzer does not certify legal equivalence.')
+                    st.warning('Before selecting vendors, validate the source clauses for geography/countries, response and resolution SLAs, hours of coverage, onsite/remote requirements, exclusions, dependencies, certifications, subcontracting, and commercial assumptions. The analyzer does not certify legal equivalence.')
         except Exception:
-            st.error('The SOW documents could not be analyzed. Check that the files are readable and in a supported format.')
+            st.error('The SOW documents could not be analyzed. Check that the files are readable, not password-protected, and within the 100 MB expanded processing limit.')
     st.stop()
 
 st.markdown("""
