@@ -729,17 +729,17 @@ def stamp_pdf(
         y_max = page_rect.height - stamp_height - margin_y
 
         if region_key == "IPLS":
-            # IPLS uses the same regional GL extraction rules as NA/LATAM and
-            # EMEA/APAC, but its stamp must be placed below "PLEASE PAY THIS AMOUNT".
+            # IPLS stamp placement is anchored below "PLEASE PAY THIS AMOUNT"
+            # and aligned to the left side of the page as in the reference image.
             please_pay_bottom = None
             for rect, block_text in occupied:
-                upper = re.sub(r"\\s+", " ", block_text.upper())
+                upper = re.sub(r"\s+", " ", block_text.upper())
                 if "PLEASE PAY THIS AMOUNT" in upper:
                     please_pay_bottom = max(please_pay_bottom or rect.y1, rect.y1)
             if please_pay_bottom is None:
                 raise ValueError("The IPLS placement anchor was not found on the selected page.")
             x_min = max(18, page_rect.x0 + 18)
-            x_max = page_rect.x1 - stamp_width - 18
+            x_max = x_min
             y_min = max(18, please_pay_bottom + 5)
             y_max = page_rect.y1 - stamp_height - 18
         elif compact_regional_stamp:
