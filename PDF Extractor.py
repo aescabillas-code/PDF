@@ -729,52 +729,31 @@ def stamp_pdf(
         y_max = page_rect.height - stamp_height - margin_y
 
         if region_key == "IPLS":
-            # IPLS stamp placement is anchored directly below the exact heading
-            # text, not the full text block that may also contain the amount.
-            heading_words = []
-            for word in page.get_text("words"):
-                heading_words.append((
-                    float(word[0]), float(word[1]), float(word[2]), float(word[3]),
-                    re.sub(r"[^A-Z0-9]+", "", str(word[4]).upper())
-                ))
-            target_words = ["PLEASE", "PAY", "THIS", "AMOUNT"]
-            heading_rect = None
-            lines_by_y = {}
-            for word in heading_words:
-                lines_by_y.setdefault(round(word[1] / 4) * 4, []).append(word)
-            for line_words in lines_by_y.values():
-                line_words.sort(key=lambda word: word[0])
-                tokens = [word[4] for word in line_words]
-                for index in range(max(0, len(tokens) - len(target_words) + 1)):
-                    if tokens[index:index + len(target_words)] == target_words:
-                        matched = line_words[index:index + len(target_words)]
-                        heading_rect = pymupdf.Rect(
-                            min(word[0] for word in matched),
-                            min(word[1] for word in matched),
-                            max(word[2] for word in matched),
-                            max(word[3] for word in matched),
+            # IPLS stamp must sit below "PLEASE PAY THIS AMOUNT" and align to
+            # the right side of the PDF page, not to the heading's left edge.
+            please_pay_rect = None
+            for rect, block_text in occupied:
+                upper = re.sub(r"\\s+", " ", block_text.upper())
+                if "PLEASE PAY THIS AMOUNT" in upper:
+                    if please_pay_rect is None:
+                        please_pay_rect = rect
+                    else:
+                        please_pay_rect = pymupdf.Rect(
+                            min(please_pay_rect.x0, rect.x0),
+                            min(please_pay_rect.y0, rect.y0),
+                            max(please_pay_rect.x1, rect.x1),
+                            max(please_pay_rect.y1, rect.y1),
                         )
-                        break
-                if heading_rect is not None:
-                    break
-            if heading_rect is None:
-                # Fallback to a matching text block if word-level extraction differs.
-                for rect, block_text in occupied:
-                    upper = re.sub(r"\\s+", " ", block_text.upper())
-                    if "PLEASE PAY THIS AMOUNT" in upper:
-                        heading_rect = rect
-                        break
-            if heading_rect is None:
+            if please_pay_rect is None:
                 raise ValueError("The IPLS placement anchor was not found on the selected page.")
-
-            # Center the stamp under the heading and keep it immediately below it.
-            x_min = max(18, min(
-                page_rect.width - stamp_width - 18,
-                (heading_rect.x0 + heading_rect.x1 - stamp_width) / 2,
-            ))
+            # Fix the horizontal position at the page's right margin. Only the
+            # vertical coordinate is searched, and every candidate remains below
+            # the anchor and subject to the existing text-overlap safety check.
+            x_min = page_rect.width - stamp_width - 18
             x_max = x_min
-            y_min = heading_rect.y1 + 8
-            y_max = y_min
+            y_min = max(18, please_pay_rect.y1 + 5)
+            y_max = page_rect.height - stamp_height - 18
+
         elif compact_regional_stamp:
             # Preserve the existing placement for NA/LATAM and EMEA/APAC:
             # below the service-description paragraph, left of NET TOTAL PAYABLE,
