@@ -262,7 +262,7 @@ st.markdown("""
 </style>
 <div class="hero">
 <h1>PDF Approval Stamp Tool</h1>
-<p>Extract Juniper GL details, validate approval totals, and stamp a separate copy of an invoice.</p>
+<p>Extract details, validate approval totals, and stamp a separate copy of an invoice.</p>
 </div>
 """, unsafe_allow_html=True)
 
