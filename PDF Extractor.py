@@ -1,5 +1,5 @@
 """
-Juniper PDF Approval Stamp Tool — privacy-hardened Streamlit app.
+PDF Approval Stamp Tool — privacy-hardened Streamlit app.
 
 Privacy controls:
 - No invoice values or extracted personal/business data are written to logs.
@@ -25,6 +25,7 @@ import pandas as pd
 import pytesseract
 from PIL import Image
 from io import BytesIO
+from datetime import date
 
 st.set_page_config(page_title="PDF Approval Stamp Tool", page_icon="📄", layout="wide", initial_sidebar_state="expanded")
 
@@ -54,6 +55,18 @@ VAT_LABEL = _CONFIG.get("vat_label", "VAT / GST")
 GL_RE = re.compile(r"(?<!\d)(\d{19})(?!\d)")
 MONEY_RE = re.compile(r"\$?\s*([\d,]+\.\d{2})")
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
+
+
+def get_approval_defaults():
+    """Read default approver identity from Streamlit secrets without hardcoding it."""
+    try:
+        approval_secrets = st.secrets.get("approval", {})
+        name = str(approval_secrets.get("approved_by", "")).strip()
+        email = str(approval_secrets.get("email", "")).strip()
+        return name, email
+    except Exception:
+        # Missing secrets should not prevent the app from running.
+        return "", ""
 APPROVAL_RE = re.compile(r"Approved\s+by\s+(.+?)\s+(\d{2}[./-]\d{2}[./-]\d{4})", re.I)
 
 
@@ -390,10 +403,10 @@ def stamp_pdf(
         font_size = 9
         line_gap = 12
 
-        stamp_lines = ["JUNIPER GL CODE                                      AMOUNT"]
+        stamp_lines = [f'{"JUNIPER GL CODE":<30}{"AMOUNT":>14}']
         for row in rows:
-            stamp_lines.append(f'{row["Juniper GL Code"]}    ${float(row["Amount"]):,.2f}')
-        stamp_lines.append(f"TOTAL AMOUNT    ${float(total):,.2f}")
+            stamp_lines.append(f'{str(row["Juniper GL Code"]):<30}${float(row["Amount"]):>13,.2f}')
+        stamp_lines.append(f'{"TOTAL AMOUNT":<30}${float(total):>13,.2f}')
         stamp_lines.append("")
         stamp_lines.append(f"Approved by {approver} {approval_date}".strip())
         if email.strip():
@@ -440,7 +453,7 @@ st.markdown("""
 </style>
 <div class="hero">
 <h1>PDF Approval Stamp Tool</h1>
-<p>Extract Juniper GL details, validate approval totals, and stamp a separate copy of an invoice.</p>
+<p>Extract details, validate approval totals, and stamp a separate copy of an invoice.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -502,6 +515,11 @@ if uploaded_pdf is not None:
         key="gl_editor",
     )
 
+    secret_approver_name, secret_approver_email = get_approval_defaults()
+    # Default approval date is the local date when extraction is generated.
+    # Allow the user to edit it if the actual approval date differs.
+    extraction_date = date.today().isoformat()
+
     first, second, third = st.columns(3)
     with first:
         default_total = float(extracted["total"]) if extracted["total"] is not None else 0.0
@@ -509,10 +527,13 @@ if uploaded_pdf is not None:
             "Total amount (verify or enter manually)", min_value=0.0, value=default_total, step=0.01, format="%.2f"
         )
     with second:
-        approver_name = st.text_input("Approved by", value=extracted["approver"])
+        approver_default = extracted["approver"] or secret_approver_name
+        approver_name = st.text_input("Approved by", value=approver_default, key="approved_by_input")
     with third:
-        approval_date = st.text_input("Approval date", value=extracted["approval_date"])
-    approver_email = st.text_input("Approver email", value=extracted["email"])
+        date_default = extraction_date
+        approval_date = st.text_input("Approval date (defaults to extraction date)", value=date_default, key="approval_date_input")
+    email_default = extracted["email"] or secret_approver_email
+    approver_email = st.text_input("Approver email", value=email_default, key="approver_email_input")
 
     final_rows = []
     for _, row in edited_frame.iterrows():
@@ -529,10 +550,10 @@ if uploaded_pdf is not None:
         st.success("Line amounts match the total. Review the stamp preview before processing.")
 
     st.subheader("Stamp preview")
-    preview_lines = ["JUNIPER GL CODE                         AMOUNT"]
+    preview_lines = [f'{"JUNIPER GL CODE":<30}{"AMOUNT":>14}']
     for row in final_rows:
-        preview_lines.append(f'{row["Juniper GL Code"]}    ${row["Amount"]:,.2f}')
-    preview_lines.append(f"TOTAL AMOUNT    ${invoice_total:,.2f}")
+        preview_lines.append(f'{str(row["Juniper GL Code"]):<30}${float(row["Amount"]):>13,.2f}')
+    preview_lines.append(f'{"TOTAL AMOUNT":<30}${float(invoice_total):>13,.2f}')
     preview_lines += ["", f"Approved by {approver_name} {approval_date}".strip(), approver_email]
     st.code("\n".join(preview_lines), language="text")
 
