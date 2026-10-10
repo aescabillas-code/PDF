@@ -42,7 +42,7 @@ header[data-testid="stHeader"] {visibility: hidden !important; height: 0 !import
 
 # Encoded configuration keeps organization-specific labels and GL suffix mappings
 # out of plain sight in this source file. This is obfuscation, not encryption.
-_RULES_B64 = "eyJyb2xlcyI6eyJJUExTIjp7InZhdF9zdWZmaXgiOiIyMSIsIm5ldF9zdWZmaXgiOiIxOSJ9LCJBVSI6eyJ2YXRfc3VmZml4IjoiMjMiLCJuZXRfc3VmZml4IjoiMTkifSwiTkEgYW5kIExBVEFNIjp7InZhdF9zdWZmaXgiOiIyMSIsIm5ldF9zdWZmaXgiOiIxOSJ9LCJVSyI6eyJ2YXRfc3VmZml4IjoiMjEiLCJuZXRfc3VmZml4IjoiMTkifSwiRU1FQSAmIEFQQUMiOnsidmF0X3N1ZmZpeCI6IjIxIiwibmV0X3N1ZmZpeCI6IjE5In19LCJhbGlhc2VzIjp7Ik5BL0xBVEFNIjoiTkEgYW5kIExBVEFNIiwiTkEgJiBMQVRBTSI6Ik5BIGFuZCBMQVRBTSIsIkVNRUEgQVBBQyI6IkVNRUEgJiBBUEFDIiwiRU1FQS9BUEFDIjoiRU1FQSAmIEFQQUMifSwibmV0X2xhYmVsIjoiTkNSIENFIG9uLXNpdGUgY29zdCAvIFN1YnRvdGFsIiwidmF0X2xhYmVsIjoiVkFUIC8gR1NUIiwiZ2xfY29kZXMiOnsibmV0IjoiMzIzMDYyNDAxMDUwMTE2NzAxOSIsInZhdCI6IjMyMzA2MjQwMTA1MDExNjcwMjEiLCJhdV9nc3QiOiIzMjMwNjI0MDEwNTAxMTY2MDIzIn0sImxhYmVsX3Rlcm1zIjp7Im5ldCI6WyJORVQgQU1PVU5UIiwiTkVUIEFNT1VOVCAoVVNEKSJdLCJ2YXQiOlsiVE9UQUwgUkVHSU9OIFZBVC9UQVhFUyIsIlRPVEFMIFJFR0lPTiBWQVQvVEFYRVMgKFVTRCkiLCJUT1RBTCBHLlMuVCIsIlRPVEFMIEdTVCJdLCJ0b3RhbCI6WyJUT1RBTCBBTU9VTlQiLCJJTlZPSUNFIFRPVEFMIl19fQ=="
+_RULES_B64 = "eyJyb2xlcyI6eyJJUExTIjp7InZhdF9zdWZmaXgiOiIyMSIsIm5ldF9zdWZmaXgiOiIxOSJ9LCJBVSI6eyJ2YXRfc3VmZml4IjoiMjMiLCJuZXRfc3VmZml4IjoiMTkifSwiTkEgYW5kIExBVEFNIjp7InZhdF9zdWZmaXgiOiIyMSIsIm5ldF9zdWZmaXgiOiIxOSJ9LCJVSyI6eyJ2YXRfc3VmZml4IjoiMjEiLCJuZXRfc3VmZml4IjoiMTkifSwiRU1FQSAmIEFQQUMiOnsidmF0X3N1ZmZpeCI6IjIxIiwibmV0X3N1ZmZpeCI6IjE5In19LCJhbGlhc2VzIjp7Ik5BL0xBVEFNIjoiTkEgYW5kIExBVEFNIiwiTkEgJiBMQVRBTSI6Ik5BIGFuZCBMQVRBTSIsIkVNRUEgQVBBQyI6IkVNRUEgJiBBUEFDIiwiRU1FQS9BUEFDIjoiRU1FQSAmIEFQQUMifSwibmV0X2xhYmVsIjoiTkNSIENFIG9uLXNpdGUgY29zdCAvIFN1YnRvdGFsIiwidmF0X2xhYmVsIjoiVkFUIC8gR1NUIiwiZ2xfY29kZXMiOnsibmV0IjoiMzIzMDYyNDAxMDUwMTE2NzAxOSIsInZhdCI6IjMyMzA2MjQwMTA1MDExNjcwMjEiLCJhdV9nc3QiOiIzMjMwNjI0MDEwNTAxMTY2MDIzIn0sImxhYmVsX3Rlcm1zIjp7Im5ldCI6WyJORVQgQU1PVU5UIChVU0QpIiwiTkVUIEFNT1VOVChVU0QpIiwiTkVUIEFNT1VOVCIsIlNVQlRPVEFMIl0sInZhdCI6WyJUT1RBTCBSRUdJT04gVkFUL1RBWEVTIChVU0QpIiwiVE9UQUwgUkVHSU9OIFZBVC9UQVhFUyhVU0QpIiwiVE9UQUwgUkVHSU9OIFZBVC9UQVhFUyIsIlRPVEFMIEcuUy5UIiwiVE9UQUwgR1NUIiwiVkFUIl0sInRvdGFsIjpbIlRPVEFMIEFNT1VOVCAoVVNEKSIsIlRPVEFMIEFNT1VOVChVU0QpIiwiVE9UQUwgQU1PVU5UIiwiSU5WT0lDRSBUT1RBTCIsIkFNT1VOVCJdfX0="
 try:
     _CONFIG = json.loads(base64.b64decode(_RULES_B64).decode("utf-8"))
 except Exception:
@@ -69,6 +69,26 @@ except Exception:
             "total": ["TOTAL AMOUNT (USD)", "TOTAL AMOUNT(USD)", "TOTAL AMOUNT", "INVOICE TOTAL"],
         },
     }
+def _apply_secret_configuration(config: dict) -> dict:
+    """Override regional GL mappings from Streamlit secrets when configured."""
+    try:
+        secret_regions = st.secrets.get("regional_gl", {})
+        if hasattr(secret_regions, "items"):
+            for region_name, values in secret_regions.items():
+                if not hasattr(values, "get"):
+                    continue
+                normalized = normalize_region(region_name) if "normalize_region" in globals() else str(region_name).strip()
+                config.setdefault("gl_codes", {})[normalized] = {
+                    "net": str(values.get("net", "")).strip(),
+                    "vat": str(values.get("vat", "")).strip(),
+                }
+    except Exception:
+        # Missing or malformed secrets should not prevent the app from starting.
+        pass
+    return config
+
+
+_CONFIG = _apply_secret_configuration(_CONFIG)
 REGION_RULES = _CONFIG["roles"]
 REGION_ALIASES = {key.upper(): value for key, value in _CONFIG.get("aliases", {}).items()}
 NET_LABEL = _CONFIG.get("net_label", "NCR CE on-site cost / Subtotal")
@@ -168,7 +188,7 @@ def _amount_near_label(text: str, labels: list[str]) -> Optional[float]:
 
     # Flattened text: map each summary label to the nearest amount before the next label.
     compact = re.sub(r"\s+", " ", text or "")
-    label_pattern = r"NET\s*AMOUNT\s*\(?\s*USD\s*\)?|TOTAL\s+REGION\s+VAT\s*/\s*TAXES\s*\(?\s*USD\s*\)?|TOTAL\s+G\.?S\.?T\.?|TOTAL\s+GST|TOTAL\s+AMOUNT\s*\(?\s*USD\s*\)?|INVOICE\s+TOTAL|SUBTOTAL|AMOUNT\s+DUE"
+    label_pattern = r"NET\s*AMOUNT\s*\(?\s*USD\s*\)?|TOTAL\s+REGION\s+VAT\s*/\s*TAXES\s*\(?\s*USD\s*\)?|TOTAL\s+G\.?S\.?T\.?|TOTAL\s+GST|TOTAL\s+AMOUNT\s*\(?\s*USD\s*\)?|INVOICE\s+TOTAL|SUBTOTAL|\bVAT\b|\bAMOUNT\b|AMOUNT\s+DUE"
     for label in labels:
         match = re.search(re.escape(label), compact, re.I)
         if match:
@@ -190,6 +210,28 @@ def extract_labeled_gl_rows(text: str, region: str) -> tuple[list[dict], Optiona
     vat_amount = _amount_near_label(text, vat_labels)
     total_amount = _amount_near_label(text, labels.get("total", ["TOTAL AMOUNT", "INVOICE TOTAL"]))
 
+    # OCR often reads the three-column summary as separate heading lines followed
+    # by one row containing the three amounts. When all three headings are present,
+    # use the last three money values on the summary page in reading order.
+    # This is a fallback only; the normal label-specific extraction takes priority
+    # when it produces a complete, arithmetically consistent result.
+    upper_text = re.sub(r"\\s+", " ", (text or "").upper())
+    has_net_label = "NET AMOUNT" in upper_text
+    has_tax_label = (
+        "TOTAL REGION VAT/TAXES" in upper_text
+        or "TOTAL G.S.T" in upper_text
+        or "TOTAL GST" in upper_text
+    )
+    has_total_label = "TOTAL AMOUNT" in upper_text or "INVOICE TOTAL" in upper_text
+    all_money = [float(value.replace(",", "")) for value in MONEY_RE.findall(text or "")]
+    if has_net_label and has_tax_label and has_total_label and len(all_money) >= 3:
+        fallback_net, fallback_tax, fallback_total = all_money[-3:]
+        # Only use the fallback when the three amounts reconcile, avoiding guesses
+        # when unrelated invoice line-item amounts are mixed into the text.
+        if round(fallback_net + fallback_tax, 2) == round(fallback_total, 2):
+            if net_amount is None or vat_amount is None or total_amount is None:
+                net_amount, vat_amount, total_amount = fallback_net, fallback_tax, fallback_total
+
     # When a document has both local-currency and USD summary rows, prefer the explicit USD label/value.
     lines = [re.sub(r"\s+", " ", line).strip() for line in (text or "").splitlines() if line.strip()]
     for i, line in enumerate(lines):
@@ -203,6 +245,26 @@ def extract_labeled_gl_rows(text: str, region: str) -> tuple[list[dict], Optiona
         rows.append({"Juniper GL Code": region_codes.get("net", ""), "Amount": net_amount})
     if vat_amount is not None:
         rows.append({"Juniper GL Code": region_codes.get("vat", ""), "Amount": vat_amount})
+
+    # Resilient fallback for flattened/OCR table layouts where all three labels
+    # are detected but label-to-column association failed. Only accept a triplet
+    # if the two component amounts reconcile exactly to the total.
+    if not rows or total_amount is None:
+        upper = re.sub(r"\\s+", " ", (text or "").upper())
+        has_net = "NET AMOUNT" in upper
+        has_tax = any(term in upper for term in ("TOTAL REGION VAT/TAXES", "TOTAL G.S.T", "TOTAL GST"))
+        has_total = "TOTAL AMOUNT" in upper or "INVOICE TOTAL" in upper
+        amounts = [float(value.replace(",", "")) for value in MONEY_RE.findall(text or "")]
+        if has_net and has_tax and has_total and len(amounts) >= 3:
+            # Prefer the last three values on the page, normally the summary row.
+            candidate_net, candidate_tax, candidate_total = amounts[-3:]
+            if round(candidate_net + candidate_tax, 2) == round(candidate_total, 2):
+                rows = [
+                    {"Juniper GL Code": region_codes.get("net", ""), "Amount": candidate_net},
+                    {"Juniper GL Code": region_codes.get("vat", ""), "Amount": candidate_tax},
+                ]
+                total_amount = candidate_total
+
     return rows, total_amount
 
 
@@ -297,9 +359,9 @@ def _looks_like_summary(page_text: str) -> bool:
     upper_text = re.sub(r"\s+", " ", (page_text or "").upper())
     has_gl_block = "JUNIPER GL CODE" in upper_text and ("TOTAL AMOUNT" in upper_text or "APPROVED BY" in upper_text)
     labels = _CONFIG.get("label_terms", {})
-    has_net = any(term.upper() in upper_text for term in labels.get("net", ["NET AMOUNT"]))
-    has_tax = any(term.upper() in upper_text for term in labels.get("vat", ["TOTAL G.S.T", "TOTAL GST"]))
-    has_total = any(term.upper() in upper_text for term in labels.get("total", ["TOTAL AMOUNT", "INVOICE TOTAL"]))
+    has_net = any(term.upper() in upper_text for term in labels.get("net", ["NET AMOUNT", "SUBTOTAL"]))
+    has_tax = any(term.upper() in upper_text for term in labels.get("vat", ["TOTAL G.S.T", "TOTAL GST", "VAT"]))
+    has_total = any(term.upper() in upper_text for term in labels.get("total", ["TOTAL AMOUNT", "INVOICE TOTAL", "AMOUNT"]))
     return has_gl_block or (has_net and has_tax and has_total)
 
 
@@ -307,7 +369,8 @@ def _looks_like_financial_summary(page_text: str) -> bool:
     """Recognize invoice totals pages even when no GL approval block exists."""
     upper_text = re.sub(r"\s+", " ", (page_text or "").upper())
     has_totals = any(label in upper_text for label in (
-        "SUBTOTAL", "TOTAL G.S.T", "TOTAL GST", "TOTAL REGION VAT/TAXES", "TOTAL AMOUNT", "INVOICE TOTAL", "AMOUNT DUE"
+        "SUBTOTAL", "TOTAL G.S.T", "TOTAL GST", "TOTAL REGION VAT/TAXES",
+        "TOTAL AMOUNT", "INVOICE TOTAL", "AMOUNT DUE", " VAT ", " AMOUNT "
     ))
     has_money = bool(MONEY_RE.search(page_text or ""))
     return has_totals and has_money
