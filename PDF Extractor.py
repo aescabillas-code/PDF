@@ -456,7 +456,9 @@ def stamp_pdf(
         page_rect = page.rect
         font_size = 9
         line_gap = 12
-        stamp_lines = ["JUNIPER GL CODE                                      AMOUNT"]
+        # Keep the stamp borderless and render the GL code and amount in
+        # separate columns. Amounts are right-aligned to the AMOUNT header.
+        stamp_lines = ["JUNIPER GL CODE", "AMOUNT"]
         for row in rows:
             stamp_lines.append(
                 f'{row["Juniper GL Code"]}    ${float(row["Amount"]):,.2f}'
@@ -559,24 +561,85 @@ def stamp_pdf(
         else:
             _, y, x = min(candidates, key=lambda item: item[0])
 
-        panel = pymupdf.Rect(x - 5, y - 5, x + stamp_width + 5, y + stamp_height + 5)
-        page.draw_rect(
-            panel,
-            color=(0.82, 0.85, 0.87),
-            fill=(1, 1, 1),
-            width=0.7,
+        # Borderless stamp: do not draw a surrounding rectangle or filled panel.
+        # Use a fixed right edge for the AMOUNT heading and all monetary values.
+        left_x = x + 5
+        amount_right_x = x + stamp_width - 5
+        amount_header = "AMOUNT"
+        header_y = y + font_size
+        page.insert_text(
+            (left_x, header_y),
+            "JUNIPER GL CODE",
+            fontname="helv",
+            fontsize=font_size,
+            color=(0, 0, 0),
             overlay=True,
         )
-        for index, line in enumerate(stamp_lines):
-            if line:
-                page.insert_text(
-                    (x + 5, y + index * line_gap + font_size),
-                    line,
-                    fontname="helv",
-                    fontsize=font_size,
-                    color=(0, 0, 0),
-                    overlay=True,
-                )
+        amount_header_width = pymupdf.get_text_length(
+            amount_header, fontname="helv", fontsize=font_size
+        )
+        page.insert_text(
+            (amount_right_x - amount_header_width, header_y),
+            amount_header,
+            fontname="helv",
+            fontsize=font_size,
+            color=(0, 0, 0),
+            overlay=True,
+        )
+
+        row_y = y + line_gap + font_size
+        for row in rows:
+            code_text = str(row["Juniper GL Code"])
+            amount_text = f'${float(row["Amount"]):,.2f}'
+            page.insert_text(
+                (left_x, row_y),
+                code_text,
+                fontname="helv",
+                fontsize=font_size,
+                color=(0, 0, 0),
+                overlay=True,
+            )
+            amount_width = pymupdf.get_text_length(
+                amount_text, fontname="helv", fontsize=font_size
+            )
+            page.insert_text(
+                (amount_right_x - amount_width, row_y),
+                amount_text,
+                fontname="helv",
+                fontsize=font_size,
+                color=(0, 0, 0),
+                overlay=True,
+            )
+            row_y += line_gap
+
+        total_text = f"TOTAL AMOUNT    ${float(total):,.2f}"
+        page.insert_text(
+            (left_x, row_y),
+            total_text,
+            fontname="helv",
+            fontsize=font_size,
+            color=(0, 0, 0),
+            overlay=True,
+        )
+        row_y += line_gap * 2
+        approval_text = f"Approved by {approver} {approval_date}".strip()
+        page.insert_text(
+            (left_x, row_y),
+            approval_text,
+            fontname="helv",
+            fontsize=font_size,
+            color=(0, 0, 0),
+            overlay=True,
+        )
+        if email.strip():
+            page.insert_text(
+                (left_x, row_y + line_gap),
+                email.strip(),
+                fontname="helv",
+                fontsize=font_size,
+                color=(0, 0, 0),
+                overlay=True,
+            )
         return document.tobytes(garbage=4, deflate=True)
     finally:
         document.close()
