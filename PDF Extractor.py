@@ -18,6 +18,7 @@ import re
 import base64
 import json
 from typing import Optional
+from datetime import datetime
 
 import streamlit as st
 import pymupdf
@@ -622,9 +623,8 @@ if uploaded_pdf is not None:
         st.error("No readable page text was detected. You can still use the tool only after selecting a readable PDF or installing/configuring OCR for scanned pages.")
         st.stop()
 
-    has_gl_summary = any(_looks_like_summary(page_text) for _, page_text in candidate_pages)
-    if not has_gl_summary:
-        st.warning("No pre-existing Juniper GL approval block was detected. Select the invoice totals page, then enter the GL codes, amounts, total, and approval details manually below.")
+    # A source invoice normally does not contain a Juniper GL approval block.
+    # Do not warn about its absence; regional summary extraction is handled below.
 
     # Auto-detect the most likely summary/approval page using the selected region's
     # labels and coordinate-matched values. Keep the dropdown available for correction.
@@ -701,7 +701,9 @@ if uploaded_pdf is not None:
     with second:
         approver_name = st.text_input("Approved by", value=extracted["approver"] or _secret_approver)
     with third:
-        approval_date = st.text_input("Approval date", value=extracted["approval_date"])
+        # Automatically use the date the user is generating the approval details.
+        approval_date = datetime.now().astimezone().strftime("%Y-%m-%d")
+        st.text_input("Approval date (automatic)", value=approval_date, disabled=True)
     approver_email = st.text_input("Approver email", value=_secret_email or extracted["email"])
 
     final_rows = []
@@ -727,6 +729,9 @@ if uploaded_pdf is not None:
     st.code("\n".join(preview_lines), language="text")
 
     if st.button("Create stamped PDF", type="primary", use_container_width=True):
+        # Refresh the approval date at generation time rather than reusing an
+        # invoice date or a date extracted from an earlier approval stamp.
+        approval_date = datetime.now().astimezone().strftime("%Y-%m-%d")
         if not final_rows:
             st.error("Add at least one GL code and amount before stamping.")
         elif not approver_name.strip() or not approval_date.strip():
