@@ -2200,7 +2200,34 @@ if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
                             ['Weighted coverage (%)', 'Confirmed covered (%)', 'Average match (%)'], ascending=False
                         )
                         scoring_frame = pd.DataFrame(score_rows)
-                        coverage_frame = coverage_frame.merge(scoring_frame, left_on='Vendor / supplier group', right_on='Vendor', how='left').drop(columns=['Vendor'])
+                        # Keep geographic evidence consistent with Gate 1. Document-title
+                        # inference is retained as a separate descriptive field only; it
+                        # must never contradict the evidence found in the SOW text.
+                        _gate_geo_columns = [
+                            'Vendor', 'Geographic footprint gate', 'Regional coverage evidence',
+                            'Gate 1 status', 'Gate 1 knockout reason', 'Gate rationale',
+                            'Failure explanation — why', 'Failure explanation — what it means',
+                        ]
+                        _gate_geo_frame = gate_frame.reindex(columns=_gate_geo_columns).copy()
+                        _gate_geo_frame = _gate_geo_frame.rename(columns={
+                            'Vendor': 'Vendor / supplier group',
+                            'Regional coverage evidence': 'Global coverage evidence',
+                        })
+                        coverage_frame = coverage_frame.drop(
+                            columns=['Global coverage evidence'], errors='ignore'
+                        ).merge(_gate_geo_frame, on='Vendor / supplier group', how='left', suffixes=('', '_gate'))
+                        coverage_frame['Global coverage evidence'] = coverage_frame.apply(
+                            lambda r: (
+                                f"{r.get('Geographic footprint gate', 'Review')}: "
+                                f"{r.get('Global coverage evidence', 'Not evidenced')}. "
+                                f"Document-title hint: {r.get('Coverage area (from document title)', 'Not established from document title')}."
+                            ),
+                            axis=1,
+                        )
+                        coverage_frame = coverage_frame.merge(
+                            scoring_frame.drop(columns=['Gate 1 status'], errors='ignore'),
+                            left_on='Vendor / supplier group', right_on='Vendor', how='left'
+                        ).drop(columns=['Vendor'])
                         coverage_frame['Rank'] = coverage_frame['Vendor / supplier group'].map(
                             {name: idx + 1 for idx, name in enumerate(ranked_vendors)}
                         )
@@ -2254,8 +2281,34 @@ if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
                         scoring_display['Gate 2 decision explanation'] = scoring_display.apply(_sow_gate2_explanation, axis=1)
                         st.dataframe(scoring_display.sort_values('Composite score (/100)', ascending=False), use_container_width=True, hide_index=True)
                         st.subheader('Vendor coverage graph')
-                        st.bar_chart(coverage_frame.set_index('Vendor / supplier group')[['Weighted coverage (%)', 'Confirmed covered (%)', 'Potential (%)']], use_container_width=True)
-                        st.caption('Weighted coverage counts each Covered scope as 1 and each Potential scope as 0.5. Confirmed and Potential are shown separately to avoid presenting uncertain matches as proven coverage. Geographic labels are inferred from document titles only; they are not proof of complete country coverage. Similarity is evidence screening, not a contractual conclusion.')
+                        try:
+                            import plotly.graph_objects as go
+                            _coverage_plot = go.Figure()
+                            _coverage_metrics = [
+                                ('Weighted coverage (%)', 'Weighted coverage'),
+                                ('Confirmed covered (%)', 'Confirmed covered'),
+                                ('Potential (%)', 'Potential'),
+                            ]
+                            for _column, _label in _coverage_metrics:
+                                _coverage_plot.add_trace(go.Bar(
+                                    name=_label,
+                                    x=coverage_frame['Vendor / supplier group'].astype(str),
+                                    y=pd.to_numeric(coverage_frame[_column], errors='coerce').fillna(0),
+                                    hovertemplate='%{x}<br>' + _label + ': %{y:.1f}%<extra></extra>',
+                                ))
+                            _coverage_plot.update_layout(
+                                barmode='group',
+                                height=max(420, min(760, 300 + 28 * len(coverage_frame))),
+                                margin=dict(l=20, r=20, t=25, b=150),
+                                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='left', x=0),
+                                yaxis=dict(title='Coverage (%)', range=[0, 100], ticksuffix='%', rangemode='tozero'),
+                                xaxis=dict(title='', tickangle=-45, automargin=True, tickfont=dict(size=10)),
+                            )
+                            st.plotly_chart(_coverage_plot, use_container_width=True)
+                        except ImportError:
+                            st.warning('Interactive coverage graph unavailable because Plotly is not installed. Install plotly from requirements.txt.')
+                            st.bar_chart(coverage_frame.set_index('Vendor / supplier group')[['Weighted coverage (%)', 'Confirmed covered (%)', 'Potential (%)']], use_container_width=True)
+                        st.caption('Bars are grouped, not stacked, and each percentage is independently capped at 100%. Weighted coverage counts each Covered scope as 1 and each Potential scope as 0.5. Geographic evidence is aligned to Gate 1 findings; document-title hints are descriptive only and do not prove country coverage. Similarity is evidence screening, not a contractual conclusion.')
     
                         st.subheader('Recommended primary vendors')
                         if primary:
@@ -2273,7 +2326,43 @@ if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
                         for name, detail in per_vendor.items():
                             statuses = {row['Scope requirement']: row['Status'] for row in detail['evidence']}
                             matrix[name] = [statuses.get(_sow_scope_label(scope), 'Gap') for scope in scope_items]
-                        st.dataframe(matrix, use_container_width=True, hide_index=True)
+
+                        # Keep vendor columns compact by using short display labels;
+                        # full legal/group names remain visible in the legend above.
+                        _matrix_vendor_names = [name for name in matrix.columns if name != 'Scope requirement']
+                        _matrix_aliases = {
+                            name: f'V{idx + 1}' for idx, name in enumerate(_matrix_vendor_names)
+                        }
+                        _matrix_display = matrix.rename(columns=_matrix_aliases).copy()
+                        _matrix_icons = {
+                            'Covered': '🟩 ✓',
+                            'Potential': '🟨 ◐',
+                            'Gap': '🟥 ✕',
+                        }
+                        for _vendor_name, _alias in _matrix_aliases.items():
+                            _matrix_display[_alias] = _matrix_display[_alias].map(
+                                lambda value: _matrix_icons.get(str(value), '⬜ ?')
+                            )
+                        st.markdown(
+                            '**Legend:** 🟩 ✓ Covered — evidence found · '
+                            '🟨 ◐ Potential — partial/uncertain match · '
+                            '🟥 ✕ Gap — no sufficient matching evidence · '
+                            '⬜ ? Unclassified — review required'
+                        )
+                        st.caption('Vendor key: ' + '  |  '.join(
+                            f"{_alias} = {_name}" for _name, _alias in _matrix_aliases.items()
+                        ))
+                        _matrix_config = {
+                            'Scope requirement': st.column_config.TextColumn('Scope requirement', width='large'),
+                        }
+                        for _alias in _matrix_aliases.values():
+                            _matrix_config[_alias] = st.column_config.TextColumn(_alias, width='small')
+                        st.dataframe(
+                            _matrix_display,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config=_matrix_config,
+                        )
     
                         st.subheader('Detailed match evidence')
                         evidence_frame = pd.DataFrame(all_evidence_rows)
