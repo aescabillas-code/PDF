@@ -1115,6 +1115,46 @@ def _sow_build_pptx(summary_frame: pd.DataFrame, gate_frame: pd.DataFrame, matri
     from pptx.chart.data import CategoryChartData
     from pptx.dml.color import RGBColor
 
+    # Normalize export schemas defensively: analysis tables may omit optional
+    # columns for small/partial datasets, but PPTX generation must still work.
+    summary_frame = summary_frame.copy()
+    gate_frame = gate_frame.copy()
+    matrix_frame = matrix_frame.copy()
+    summary_defaults = {
+        "Rank": "",
+        "Vendor": "Unidentified vendor",
+        "Gate 1 status": "Review",
+        "Global reach": 0,
+        "Scope breadth": 0,
+        "SLA rigor": 0,
+        "Commercials": 0,
+        "Composite score (/100)": 0,
+        "Recommended role": "Not shortlisted",
+    }
+    for column, default in summary_defaults.items():
+        if column not in summary_frame.columns:
+            summary_frame[column] = default
+    gate_defaults = {
+        "Vendor": "Unidentified vendor",
+        "Regional coverage evidence": "Not evidenced",
+        "Core scope evidence": "Not evidenced",
+        "Compliance evidence": "Not evidenced",
+        "Gate 1 status": "Review",
+        "Gate rationale": "Evidence requires manual review.",
+    }
+    for column, default in gate_defaults.items():
+        if column not in gate_frame.columns:
+            gate_frame[column] = default
+    if "Scope requirement" not in matrix_frame.columns:
+        matrix_frame.insert(0, "Scope requirement", "No scope rows available")
+    if "Rank" not in summary_frame.columns or summary_frame["Rank"].eq("").all():
+        summary_frame["Rank"] = range(1, len(summary_frame) + 1)
+    summary_frame["Composite score (/100)"] = pd.to_numeric(
+        summary_frame["Composite score (/100)"], errors="coerce"
+    ).fillna(0)
+    for column in ("Global reach", "Scope breadth", "SLA rigor", "Commercials"):
+        summary_frame[column] = pd.to_numeric(summary_frame[column], errors="coerce").fillna(0)
+
     prs = Presentation()
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
@@ -1229,10 +1269,12 @@ def _sow_build_pptx(summary_frame: pd.DataFrame, gate_frame: pd.DataFrame, matri
     # Gate 1 evidence / compliance
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     title(slide, "Gate 1 — Non-Negotiable Screening", "Explicit failures are knocked out. Missing or ambiguous evidence is flagged for manual verification.")
-    gcols = ["Vendor", "Regional coverage evidence", "Core scope evidence", "Compliance evidence", "Gate 1 status", "Gate rationale"]
-    gshow = gate_frame[gcols].head(15)
+    gcols = ["Vendor", "Regional coverage evidence", "Core scope evidence", "Compliance evidence",
+             "Gate 1 status", "Gate rationale", "Failure explanation — what it means"]
+    gcols = [c for c in gcols if c in gate_frame.columns]
+    gshow = gate_frame.reindex(columns=gcols).head(15)
     table = slide.shapes.add_table(len(gshow)+1, len(gcols), Inches(.4), Inches(1.5), Inches(12.5), Inches(min(5.25, .34*(len(gshow)+1)))).table
-    gw = [1.45,2.0,2.0,1.8,1.1,4.15]
+    gw = [1.25,1.65,1.55,1.45,.9,1.7,4.0]
     for j,w in enumerate(gw): table.columns[j].width = Inches(w)
     for j,c in enumerate(gcols):
         cell=table.cell(0,j); cell.text=c; cell.fill.solid(); cell.fill.fore_color.rgb=navy
@@ -1262,6 +1304,107 @@ def _sow_build_pptx(summary_frame: pd.DataFrame, gate_frame: pd.DataFrame, matri
             cell.fill.solid(); cell.fill.fore_color.rgb=RGBColor(245,249,251) if i%2 else RGBColor(255,255,255)
             for pp in cell.text_frame.paragraphs: pp.font.size=Pt(7); pp.font.color.rgb=navy
     footer(slide, 5)
+
+    # Regional footprint / operating readiness snapshot (slide 6).
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    title(slide, "Global Footprint & Coverage Readiness",
+          "Coverage labels are evidence signals only; verify country, entity, delivery-center, and subcontractor clauses.")
+    coverage_cols = [c for c in matrix_frame.columns if c != "Scope requirement"]
+    coverage_cols = coverage_cols[:6]
+    regions = ["Americas", "EMEA", "APAC"]
+    footprint_rows = []
+    for vendor in summary_frame["Vendor"].astype(str).tolist()[:6]:
+        row = {"Vendor": vendor}
+        # Matrix scope labels are not reliable proof of geography, so use the
+        # Gate 1 regional evidence as the source for this qualitative snapshot.
+        match = gate_frame[gate_frame["Vendor"].astype(str) == vendor]
+        regional = str(match.iloc[0].get("Regional coverage evidence", "Not evidenced")) if not match.empty else "Not evidenced"
+        for region in regions:
+            row[region] = "Evidence mentioned" if region.lower() in regional.lower() else "Verify"
+        footprint_rows.append(row)
+    fp = pd.DataFrame(footprint_rows, columns=["Vendor"] + regions)
+    table = slide.shapes.add_table(max(1, len(fp)+1), 4, Inches(1.1), Inches(1.65), Inches(11.1), Inches(min(4.4, .55*(len(fp)+1)))).table
+    for j, c in enumerate(["Vendor"] + regions):
+        cell = table.cell(0,j); cell.text = c; cell.fill.solid(); cell.fill.fore_color.rgb = navy
+        for pp in cell.text_frame.paragraphs:
+            pp.font.size = Pt(11); pp.font.bold = True; pp.font.color.rgb = RGBColor(255,255,255)
+    for i, (_, r) in enumerate(fp.iterrows(), 1):
+        for j, c in enumerate(["Vendor"] + regions):
+            cell = table.cell(i,j); cell.text = str(r.get(c, "Verify"))
+            cell.fill.solid(); cell.fill.fore_color.rgb = RGBColor(245,249,251) if i%2 else RGBColor(255,255,255)
+            for pp in cell.text_frame.paragraphs:
+                pp.font.size = Pt(10); pp.font.color.rgb = navy
+    footer(slide, 6)
+
+    # Primary and contingency allocation (slide 7).
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    title(slide, "Primary & Contingency Allocation",
+          "Allocation is a ranked recommendation; confirm scope fit, rate cards, standby terms, and activation triggers before award.")
+    role_rows = summary_frame[
+        (summary_frame["Recommended role"].astype(str) != "Not shortlisted") &
+        (summary_frame["Gate 1 status"].astype(str) != "Fail")
+    ].sort_values("Rank").head(6)
+    alloc_cols = ["Recommended role", "Vendor", "Composite score (/100)", "Global reach", "Scope breadth", "SLA rigor", "Commercials"]
+    table = slide.shapes.add_table(max(1, len(role_rows)+1), len(alloc_cols), Inches(.45), Inches(1.6), Inches(12.4), Inches(min(3.6, .48*(len(role_rows)+1)))).table
+    alloc_widths = [1.65, 2.15, 1.55, 1.45, 1.45, 1.45, 1.55]
+    for j, w in enumerate(alloc_widths):
+        table.columns[j].width = Inches(w)
+    for j,c in enumerate(alloc_cols):
+        cell=table.cell(0,j); cell.text=c; cell.fill.solid(); cell.fill.fore_color.rgb=navy
+        for pp in cell.text_frame.paragraphs:
+            pp.font.size=Pt(9); pp.font.bold=True; pp.font.color.rgb=RGBColor(255,255,255)
+    for i,(_,r) in enumerate(role_rows.iterrows(),1):
+        for j,c in enumerate(alloc_cols):
+            cell=table.cell(i,j); cell.text=str(r.get(c,""))
+            cell.fill.solid(); cell.fill.fore_color.rgb=RGBColor(245,249,251) if i%2 else RGBColor(255,255,255)
+            for pp in cell.text_frame.paragraphs:
+                pp.font.size=Pt(9); pp.font.color.rgb=navy
+    allocation_note = slide.shapes.add_textbox(Inches(.7), Inches(5.1), Inches(11.9), Inches(1.15))
+    allocation_note.text_frame.text = (
+        "Primary tier: highest-ranked eligible vendors for core delivery.\n"
+        "Backup tier: next-ranked eligible vendors for failover, surge, or specialized scope.\n"
+        "Governance check: do not claim zero single-points-of-failure unless country-level and service-pillar coverage is verified."
+    )
+    for pp in allocation_note.text_frame.paragraphs:
+        pp.font.size = Pt(12); pp.font.color.rgb = navy
+    footer(slide, 7)
+
+    # Commercial decision checks and transition roadmap (slide 8).
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    title(slide, "Commercial Controls & Implementation Roadmap",
+          "Commercial indices are comparative signals; validate actual rate cards, volume assumptions, and contract protections.")
+    left = slide.shapes.add_textbox(Inches(.65), Inches(1.55), Inches(5.9), Inches(4.9))
+    left.text_frame.text = (
+        "COMMERCIAL VALIDATION\n"
+        "• Compare blended hourly/unit rates by region and service line\n"
+        "• Validate minimum commitments, transition fees, indexation, and volume discounts\n"
+        "• Negotiate SLA credit formulas and termination-for-convenience terms\n"
+        "• Confirm standby vendors have no hidden minimum spend or retainer\n"
+        "• Model baseline cost and savings only where source data supports the calculation"
+    )
+    right = slide.shapes.add_textbox(Inches(6.75), Inches(1.55), Inches(5.9), Inches(4.9))
+    right.text_frame.text = (
+        "PROPOSED TRANSITION SEQUENCE\n"
+        "Weeks 1–2: Legal review and MSA / standby agreement finalization\n"
+        "Weeks 3–4: SOW sign-off, SLA schedules, governance dashboard setup\n"
+        "Weeks 5–8: Phased onboarding, knowledge transfer, shadow-support pilot\n"
+        "Week 9: Production cutover after readiness and risk sign-off\n\n"
+        "Decision requested: authorize controlled negotiations with the recommended primary and backup tiers."
+    )
+    for shape in (left, right):
+        for pp in shape.text_frame.paragraphs:
+            pp.font.size = Pt(13); pp.font.color.rgb = navy
+            if pp.text.isupper():
+                pp.font.bold = True
+    disclaimer = slide.shapes.add_textbox(Inches(.7), Inches(6.45), Inches(12), Inches(.42))
+    disclaimer.text_frame.text = (
+        "Before vendor selection, validate source clauses for countries, response/resolution SLAs, coverage hours, "
+        "onsite/remote delivery, exclusions, dependencies, certifications, subcontracting, and commercial assumptions. "
+        "This analyzer does not certify legal equivalence."
+    )
+    for pp in disclaimer.text_frame.paragraphs:
+        pp.font.size = Pt(8); pp.font.color.rgb = grey
+    footer(slide, 8)
 
     out = BytesIO()
     prs.save(out)
@@ -1876,10 +2019,24 @@ if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
                                 rf'\b(?:does not|cannot|unable to|do not|not able to|no coverage in|excluded from)\b.{{0,55}}\b{region.lower()}\b',
                                 text_norm, re.I
                             ) for region in ('Americas', 'EMEA', 'APAC'))
-                            compliance_terms = ['iso 27001', 'iso27001', 'soc 2', 'soc2', 'data residency', 'data sovereignty',
-                                                'gdpr', 'regional labor', 'labour compliance', 'security controls', 'security compliance']
+                            compliance_terms = ['iso 27001', 'iso27001', 'soc 2', 'soc2', 'gdpr', 'data residency', 'data sovereignty',
+                                                'regional labor', 'labour compliance', 'security controls', 'security compliance']
                             compliance_hits = [term for term in compliance_terms if term in text_norm]
-                            compliance_neg = bool(re.search(r'(not certified|certification expired|does not comply|non-compliant|not compliant|fails? to meet)', text_norm, re.I))
+                            # Look for a negative statement tied to a specific obligation,
+                            # rather than treating any mention of GDPR/SOC 2 as failure.
+                            obligation_patterns = {
+                                'GDPR': r'\\b(?:not compliant with|does not comply with|non[- ]compliant with|fails? to comply with|unable to comply with|cannot comply with|not meeting)\\b.{0,90}\\bgdpr\\b|\\bgdpr\\b.{0,90}\\b(?:not compliant|non[- ]compliant|does not comply|fails? to comply|unable to comply|cannot comply|not met|not meeting)\\b',
+                                'SOC 2': r'\\b(?:not certified|certification expired|does not hold|lacks?|without|failed to obtain|not compliant with)\\b.{0,70}\\bsoc\\s*2\\b|\\bsoc\\s*2\\b.{0,70}\\b(?:not certified|expired|missing|not held|not compliant|non[- ]compliant)\\b',
+                                'ISO 27001': r'\\b(?:not certified|certification expired|does not hold|lacks?|without|failed to obtain|not compliant with)\\b.{0,70}\\biso\\s*27001\\b|\\biso\\s*27001\\b.{0,70}\\b(?:not certified|expired|missing|not held|not compliant|non[- ]compliant)\\b',
+                                'data residency': r'\\b(?:cannot|does not|unable to|will not|not able to)\\b.{0,70}\\b(?:meet|support|provide|guarantee|comply with)\\b.{0,45}\\bdata residenc\\w*\\b|\\bdata residenc\\w*\\b.{0,70}\\b(?:not supported|not available|cannot be guaranteed|not compliant)\\b',
+                            }
+                            obligation_failures = [label for label, pattern in obligation_patterns.items()
+                                                   if re.search(pattern, text_norm, re.I)]
+                            generic_compliance_neg = bool(re.search(
+                                r'\\b(?:not certified|certification expired|does not comply|non-compliant|non compliant|not compliant|fails? to meet)\\b',
+                                text_norm, re.I
+                            ))
+                            compliance_neg = bool(obligation_failures) or generic_compliance_neg
                             core_terms = ['service desk', 'technical support', 'incident management', 'request fulfillment',
                                           'field service', 'onsite support', 'remote support', 'service delivery',
                                           'operations support', 'managed services', 'scope of services']
@@ -1888,10 +2045,46 @@ if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
                                             '24/7', '24x7', 'multilingual', 'in-country', 'in country']
                             global_hits = [term for term in global_terms if term in text_norm]
                             fail_reasons = []
+                            gate_explanations = []
                             if explicit_region_fail:
                                 fail_reasons.append('Geographic footprint: explicit regional coverage limitation')
-                            if compliance_neg:
+                                gate_explanations.append(
+                                    'Why: the SOW explicitly limits or excludes coverage in a required region. '
+                                    'Meaning: the vendor may not deliver directly in every required theater; verify country-level coverage and entity structure.'
+                                )
+                            if obligation_failures:
+                                for obligation in obligation_failures:
+                                    if obligation == 'GDPR':
+                                        fail_reasons.append('Compliance/security: GDPR non-compliance explicitly stated')
+                                        gate_explanations.append(
+                                            'Why: the source clause appears to state that GDPR requirements are not met. '
+                                            'Meaning: GDPR is the EU data-protection law; non-compliance may prevent lawful processing of applicable personal data. '
+                                            'Validate the exact clause with Privacy/Legal before disqualification.'
+                                        )
+                                    elif obligation == 'SOC 2':
+                                        fail_reasons.append('Compliance/security: SOC 2 status explicitly deficient')
+                                        gate_explanations.append(
+                                            'Why: the source appears to state that SOC 2 certification/report status is absent, expired, or not met. '
+                                            'Meaning: SOC 2 is an independent controls-assurance report, not a general legal certification. Confirm the required report type and period.'
+                                        )
+                                    elif obligation == 'ISO 27001':
+                                        fail_reasons.append('Compliance/security: ISO 27001 status explicitly deficient')
+                                        gate_explanations.append(
+                                            'Why: the source appears to state that ISO 27001 certification is absent, expired, or not met. '
+                                            'Meaning: this standard concerns an information-security management system; confirm scope, entity, and certificate validity.'
+                                        )
+                                    else:
+                                        fail_reasons.append('Compliance/security: data-residency requirement explicitly unmet')
+                                        gate_explanations.append(
+                                            'Why: the source appears to state that required data-residency conditions cannot be met. '
+                                            'Meaning: data may not be stored or processed in the required geography; Privacy/Legal must validate the exact obligation.'
+                                        )
+                            elif generic_compliance_neg:
                                 fail_reasons.append('Compliance/security: explicit non-compliance or certification failure')
+                                gate_explanations.append(
+                                    'Why: the source contains a negative compliance/certification statement, but the exact obligation needs manual confirmation. '
+                                    'Meaning: a mandatory security or regulatory requirement may be unmet; verify the source clause before final exclusion.'
+                                )
                             geography_gate = 'Fail' if explicit_region_fail else ('Pass' if all(region_found.values()) else 'Review')
                             core_gate = 'Pass' if core_hits else 'Review'
                             compliance_gate = 'Fail' if compliance_neg else ('Pass' if compliance_hits else 'Review')
@@ -1901,6 +2094,11 @@ if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
                             gate_reason = '; '.join(fail_reasons) if fail_reasons else (
                                 'All non-negotiable evidence categories found' if gate_status == 'Pass'
                                 else 'Review the gate categories marked Review; missing evidence is not proof of failure'
+                            )
+                            gate_explanation = ' '.join(gate_explanations) if gate_explanations else (
+                                'No explicit knockout was detected. Review means the source did not establish the requirement clearly enough; it is not proof of non-compliance.'
+                                if gate_status == 'Review' else
+                                'The available text contains evidence for the configured screening categories; confirm the actual clauses and applicable scope before award.'
                             )
                             gate_rows.append({
                                 'Vendor': vendor_name,
@@ -1913,6 +2111,9 @@ if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
                                 'Gate 1 status': gate_status,
                                 'Gate 1 knockout reason': '; '.join(fail_reasons) if fail_reasons else ('None detected' if gate_status == 'Pass' else 'No explicit knockout; evidence review required'),
                                 'Gate rationale': gate_reason,
+                                'Failure explanation — why': '; '.join(fail_reasons) if fail_reasons else 'No explicit failure detected',
+                                'Failure explanation — what it means': gate_explanation,
+                                'Manual validation required': 'Yes' if gate_status in ('Fail', 'Review') else 'Confirm clause scope before award',
                             })
     
                             # Four weighted pillars. Indicators are evidence proxies and should be
@@ -2017,6 +2218,40 @@ if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
                             lambda status: 'Eligible for weighted ranking' if status != 'Fail' else 'Excluded — Gate 1 knockout'
                         ))
                         scoring_display['Rank'] = scoring_display['Rank'].replace('', 'Knocked out')
+
+                        def _sow_gate2_explanation(row):
+                            vendor_name = str(row.get('Vendor', 'Vendor'))
+                            status = str(row.get('Gate 1 status', 'Review'))
+                            role = str(row.get('Recommended role', 'Not shortlisted'))
+                            if status == 'Fail':
+                                gate_match = gate_frame[gate_frame['Vendor'].astype(str) == vendor_name]
+                                reason = ''
+                                if not gate_match.empty:
+                                    reason = str(gate_match.iloc[0].get('Gate 1 knockout reason', '') or '')
+                                return (
+                                    f'Not scored for selection: Gate 1 failed. {reason} '
+                                    'Meaning: a mandatory screening concern must be resolved before weighted comparison.'
+                                ).strip()
+                            score_values = {
+                                'Global reach': pd.to_numeric(pd.Series([row.get('Global reach (/100)', 0)]), errors='coerce').fillna(0).iloc[0],
+                                'Scope breadth': pd.to_numeric(pd.Series([row.get('Scope breadth (/100)', 0)]), errors='coerce').fillna(0).iloc[0],
+                                'SLA rigor': pd.to_numeric(pd.Series([row.get('SLA rigor (/100)', 0)]), errors='coerce').fillna(0).iloc[0],
+                                'Commercials & scalability': pd.to_numeric(pd.Series([row.get('Commercials & scalability (/100)', 0)]), errors='coerce').fillna(0).iloc[0],
+                            }
+                            weakest = sorted(score_values.items(), key=lambda item: item[1])[:2]
+                            weak_text = ', '.join(f'{name} ({value:.1f}/100)' for name, value in weakest)
+                            if role != 'Not shortlisted':
+                                return (
+                                    f'Eligible under Gate 1; selected as {role} based on relative composite ranking. '
+                                    f'Lowest-scoring pillars to validate or negotiate: {weak_text}. '
+                                    'Meaning: this is a comparative ranking, not proof of contractual compliance or legal equivalence.'
+                                )
+                            return (
+                                f'Gate 1 did not detect an explicit knockout, but this vendor is outside the top-six shortlist '
+                                f'under the current relative ranking. Lowest-scoring pillars: {weak_text}. '
+                                'Meaning: lower relative fit, not an automatic compliance failure; validate evidence and adjust weights only through approved governance.'
+                            )
+                        scoring_display['Gate 2 decision explanation'] = scoring_display.apply(_sow_gate2_explanation, axis=1)
                         st.dataframe(scoring_display.sort_values('Composite score (/100)', ascending=False), use_container_width=True, hide_index=True)
                         st.subheader('Vendor coverage graph')
                         st.bar_chart(coverage_frame.set_index('Vendor / supplier group')[['Weighted coverage (%)', 'Confirmed covered (%)', 'Potential (%)']], use_container_width=True)
@@ -2063,11 +2298,22 @@ if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
                             }).to_excel(writer, index=False, sheet_name='Recommendations')
                         st.download_button('Download SOW comparison workbook', data=export_buffer.getvalue(), file_name='Vendor_SOW_Analysis.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', use_container_width=True)
                         try:
-                            pptx_summary = coverage_frame[[
+                            _pptx_required = [
                                 'Vendor / supplier group', 'Composite score (/100)', 'Gate 1 status',
                                 'Global reach (/100)', 'Scope breadth (/100)', 'SLA rigor (/100)',
-                                'Commercials & scalability (/100)', 'Recommended role'
-                            ]].rename(columns={
+                                'Commercials & scalability (/100)', 'Recommended role', 'Rank'
+                            ]
+                            _pptx_defaults = {
+                                'Vendor / supplier group': 'Unidentified vendor',
+                                'Composite score (/100)': 0, 'Gate 1 status': 'Review',
+                                'Global reach (/100)': 0, 'Scope breadth (/100)': 0, 'SLA rigor (/100)': 0,
+                                'Commercials & scalability (/100)': 0, 'Recommended role': 'Not shortlisted',
+                                'Rank': '',
+                            }
+                            for _column, _default in _pptx_defaults.items():
+                                if _column not in coverage_frame.columns:
+                                    coverage_frame[_column] = _default
+                            pptx_summary = coverage_frame.reindex(columns=_pptx_required).rename(columns={
                                 'Vendor / supplier group': 'Vendor',
                                 'Global reach (/100)': 'Global reach',
                                 'Scope breadth (/100)': 'Scope breadth',
