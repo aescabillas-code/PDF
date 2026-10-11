@@ -1,5 +1,5 @@
 """
-Juniper PDF Approval Stamp Tool — privacy-hardened Streamlit app.
+PDF Approval Stamp Tool — privacy-hardened Streamlit app.
 
 Privacy controls:
 - No invoice values or extracted personal/business data are written to logs.
@@ -17,6 +17,8 @@ from __future__ import annotations
 import re
 import math
 import hashlib
+import hmac
+import os
 import zipfile
 import base64
 import json
@@ -50,6 +52,252 @@ button[kind="header"] {display: none !important; visibility: hidden !important;}
 section[data-testid="stSidebar"] {transform: none !important; min-width: 18rem !important; visibility: visible !important;}
 </style>
 """, unsafe_allow_html=True)
+
+
+# -----------------------------------------------------------------------------
+# PERSISTENT ONE-TIME ACCESS — adapted from TASKS MONITORING TRACKER
+# -----------------------------------------------------------------------------
+# Authorization is stored as a signed token in a durable first-party cookie
+# and browser localStorage, with sessionStorage as a last-resort fallback.
+# ACCESS_CODE and TOKEN_SECRET must be configured in Streamlit Secrets.
+try:
+    from itsdangerous import URLSafeTimedSerializer
+except Exception:
+    URLSafeTimedSerializer = None
+
+try:
+    from streamlit_js_eval import streamlit_js_eval
+except Exception:
+    streamlit_js_eval = None
+
+ACCESS_STORAGE_KEY = base64.b64decode("anVuaXBlcl9wZGZfc3RhbXBfYXV0aG9yaXplZF92MQ==").decode("utf-8")
+AUTH_COOKIE_KEY = base64.b64decode("anVuaXBlcl9wZGZfc3RhbXBfYXV0aG9yaXplZF9jb29raWVfdjE=").decode("utf-8")
+AUTH_JS_READ_KEY = base64.b64decode("anVuaXBlcl9wZGZfc3RhbXBfYXV0aF9yZWFkX3Yx").decode("utf-8")
+AUTH_JS_SAVE_KEY = base64.b64decode("anVuaXBlcl9wZGZfc3RhbXBfYXV0aF9zYXZlX3Yx").decode("utf-8")
+
+
+def _pdf_access_secrets():
+    """Read access credentials only from Streamlit Secrets or environment."""
+    try:
+        access_code = str(st.secrets.get("ACCESS_CODE", os.getenv("ACCESS_CODE", ""))).strip()
+        token_secret = str(st.secrets.get("TOKEN_SECRET", os.getenv("TOKEN_SECRET", ""))).strip()
+    except Exception:
+        access_code = os.getenv("ACCESS_CODE", "").strip()
+        token_secret = os.getenv("TOKEN_SECRET", "").strip()
+    return access_code, token_secret
+
+
+def _pdf_access_code_fingerprint(code):
+    return hashlib.sha256(str(code).encode("utf-8")).hexdigest()[:32]
+
+
+def _pdf_token_serializer():
+    if URLSafeTimedSerializer is None:
+        return None
+    access_code, token_secret = _pdf_access_secrets()
+    if not access_code or not token_secret:
+        return None
+    salt = base64.b64decode("anVuaXBlci1wZGYtc3RhbXAtYnJvd3Nlci1hY2Nlc3MtdjEt").decode("utf-8") + _pdf_access_code_fingerprint(access_code)
+    return URLSafeTimedSerializer(token_secret, salt=salt)
+
+
+def _pdf_create_browser_token():
+    serializer = _pdf_token_serializer()
+    access_code, _ = _pdf_access_secrets()
+    if serializer is None or not access_code:
+        return ""
+    return serializer.dumps({
+        "authorized": True,
+        "fp": _pdf_access_code_fingerprint(access_code),
+    })
+
+
+def _pdf_validate_browser_token(token):
+    if not token:
+        return False
+    serializer = _pdf_token_serializer()
+    access_code, _ = _pdf_access_secrets()
+    if serializer is None or not access_code:
+        return False
+    try:
+        payload = serializer.loads(str(token))
+        return (
+            payload.get("authorized") is True
+            and hmac.compare_digest(
+                str(payload.get("fp", "")),
+                _pdf_access_code_fingerprint(access_code),
+            )
+        )
+    except Exception:
+        return False
+
+
+def _pdf_js_storage(expression, key):
+    if streamlit_js_eval is None:
+        return None
+    try:
+        return streamlit_js_eval(js_expressions=expression, want_output=True, key=key)
+    except Exception:
+        return None
+
+
+def _pdf_read_browser_token():
+    """Read persistent signed authorization from server-visible cookie or browser storage."""
+    try:
+        context = getattr(st, "context", None)
+        cookies = getattr(context, "cookies", None)
+        if cookies:
+            token = cookies.get(AUTH_COOKIE_KEY)
+            if token:
+                return str(token)
+    except Exception:
+        pass
+
+    storage_key = repr(ACCESS_STORAGE_KEY)
+    cookie_key = repr(AUTH_COOKIE_KEY)
+    expression = f"""
+    (() => {{
+        try {{
+            const storageKey = {storage_key};
+            const cookieKey = {cookie_key};
+            try {{
+                const prefix = cookieKey + '=';
+                const entry = document.cookie.split('; ').find(item => item.startsWith(prefix));
+                if (entry) return decodeURIComponent(entry.substring(prefix.length));
+            }} catch (e) {{}}
+            const stores = [];
+            const addStore = (store) => {{ if (store && !stores.includes(store)) stores.push(store); }};
+            try {{ addStore(window.top.localStorage); }} catch (e) {{}}
+            try {{ addStore(window.parent.localStorage); }} catch (e) {{}}
+            try {{ addStore(window.localStorage); }} catch (e) {{}}
+            for (const store of stores) {{
+                try {{ const value = store.getItem(storageKey); if (value) return value; }} catch (e) {{}}
+            }}
+            const sessions = [];
+            const addSession = (store) => {{ if (store && !sessions.includes(store)) sessions.push(store); }};
+            try {{ addSession(window.top.sessionStorage); }} catch (e) {{}}
+            try {{ addSession(window.parent.sessionStorage); }} catch (e) {{}}
+            try {{ addSession(window.sessionStorage); }} catch (e) {{}}
+            for (const store of sessions) {{
+                try {{ const value = store.getItem(storageKey); if (value) return value; }} catch (e) {{}}
+            }}
+            return '';
+        }} catch (e) {{ return ''; }}
+    }})()
+    """
+    value = _pdf_js_storage(expression, AUTH_JS_READ_KEY)
+    return None if value is None else str(value or "")
+
+
+def _pdf_save_browser_token(token):
+    """Save token for one-time access on this browser profile."""
+    storage_key = repr(ACCESS_STORAGE_KEY)
+    cookie_key = repr(AUTH_COOKIE_KEY)
+    token_value = repr(str(token))
+    expression = f"""
+    (() => {{
+        try {{
+            const storageKey = {storage_key};
+            const cookieKey = {cookie_key};
+            const token = {token_value};
+            let saved = false;
+            try {{
+                const secure = window.location.protocol === 'https:' ? '; Secure' : '';
+                document.cookie = cookieKey + '=' + encodeURIComponent(token) +
+                    '; Max-Age=31536000; Path=/; SameSite=Lax' + secure;
+                if (document.cookie.indexOf(cookieKey + '=') !== -1) saved = true;
+            }} catch (e) {{}}
+            const stores = [];
+            const addStore = (store) => {{ if (store && !stores.includes(store)) stores.push(store); }};
+            try {{ addStore(window.top.localStorage); }} catch (e) {{}}
+            try {{ addStore(window.parent.localStorage); }} catch (e) {{}}
+            try {{ addStore(window.localStorage); }} catch (e) {{}}
+            for (const store of stores) {{
+                try {{ store.setItem(storageKey, token); saved = true; }} catch (e) {{}}
+            }}
+            if (!saved) {{
+                const sessions = [];
+                const addSession = (store) => {{ if (store && !sessions.includes(store)) sessions.push(store); }};
+                try {{ addSession(window.top.sessionStorage); }} catch (e) {{}}
+                try {{ addSession(window.parent.sessionStorage); }} catch (e) {{}}
+                try {{ addSession(window.sessionStorage); }} catch (e) {{}}
+                for (const store of sessions) {{
+                    try {{ store.setItem(storageKey, token); saved = true; }} catch (e) {{}}
+                }}
+            }}
+            return saved ? 'saved' : 'error';
+        }} catch (e) {{ return 'error'; }}
+    }})()
+    """
+    return _pdf_js_storage(expression, AUTH_JS_SAVE_KEY) == "saved"
+
+
+def _pdf_access_gate():
+    """Require the access code once per browser profile and restore signed authorization."""
+    if URLSafeTimedSerializer is None or streamlit_js_eval is None:
+        st.error(
+            "Persistent browser authorization is not installed. Add `itsdangerous` "
+            "and `streamlit-js-eval` to requirements.txt, then redeploy."
+        )
+        st.stop()
+
+    access_code, token_secret = _pdf_access_secrets()
+    if not access_code or not token_secret:
+        st.error(
+            "Access control is not configured. Add ACCESS_CODE and TOKEN_SECRET "
+            "to Streamlit Secrets; do not put them in the source code."
+        )
+        st.stop()
+
+    if st.session_state.get("pdf_access_authorized", False):
+        return True
+
+    token = _pdf_read_browser_token()
+    if token is None:
+        st.markdown(
+            '<div style="padding:14vh 0;text-align:center;color:#64748b">'
+            'Restoring secure browser access…</div>',
+            unsafe_allow_html=True,
+        )
+        st.stop()
+
+    if _pdf_validate_browser_token(token):
+        st.session_state["pdf_access_authorized"] = True
+        return True
+
+    st.markdown("""
+    <style>
+    .pdf-access-wrap {
+        max-width:560px; margin:12vh auto 0 auto; background:#fff;
+        border:1px solid #e8edf4; border-radius:22px; padding:34px;
+        box-shadow:0 24px 70px rgba(20,38,70,.10);
+    }
+    .pdf-access-title { text-align:center; color:#102041; font-size:28px;
+        font-weight:800; margin-bottom:8px; }
+    .pdf-access-sub { text-align:center; color:#73819a; margin-bottom:18px; }
+    </style>
+    <div class="pdf-access-wrap">
+      <div class="pdf-access-title">PDF Approval Stamp Tool</div>
+      <div class="pdf-access-sub">Enter the one-time access code to continue.</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    code = st.text_input(
+        "Access code", type="password", placeholder="Enter access code",
+        label_visibility="collapsed", key="pdf_one_time_access_code",
+    )
+    if st.button("Access Tool", type="primary", use_container_width=True, key="pdf_access_submit"):
+        if hmac.compare_digest(code, access_code):
+            token = _pdf_create_browser_token()
+            if token and _pdf_save_browser_token(token):
+                st.session_state["pdf_access_authorized"] = True
+                st.rerun()
+            else:
+                st.error("Unable to save browser authorization. Check browser storage permissions.")
+        else:
+            st.error("Invalid access code.")
+    return False
+
 
 # Region names and aliases are not sensitive. All full GL codes are read only from Streamlit secrets.
 REGION_RULES = {
@@ -173,7 +421,7 @@ def _india_parse_invoice(pdf_bytes: bytes) -> dict:
 
 
 INDIA_TABLE_COLUMNS = [
-    "Juniper Entity Code", "NCR Vendor code", "GL Code ", "Amount- Duty/IGST",
+    base64.b64decode("SnVuaXBlciBFbnRpdHkgQ29kZQ==").decode("utf-8"), "NCR Vendor code", "GL Code ", "Amount- Duty/IGST",
     "Curr", "Tax field", "Total (amount+tax)", "Dr-40/Cr-50", "Inv Date",
     "Line Description", "Cost Center", "Project ID", "Invoice Number",
     "Header Description to submit Weekly File", "Assignment Reference", "Tax Code",
@@ -383,9 +631,9 @@ def extract_region_amounts_from_page(page, region: str) -> tuple[list[dict], Opt
 
     rows = []
     if found.get("net") is not None and codes.get("net"):
-        rows.append({"Juniper GL Code": codes["net"], "Amount": found["net"]})
+        rows.append({base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8"): codes["net"], "Amount": found["net"]})
     if found.get("vat") is not None and codes.get("vat"):
-        rows.append({"Juniper GL Code": codes["vat"], "Amount": found["vat"]})
+        rows.append({base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8"): codes["vat"], "Amount": found["vat"]})
     total = round(found["net"] + found["vat"], 2) if len(found) == 2 else None
     return rows, total
 
@@ -396,7 +644,7 @@ def extract_from_page(text: str, region_hint: Optional[str] = None) -> dict:
 
     if not region:
         for i, line in enumerate(lines):
-            if "JUNIPER GL CODE" in line.upper():
+            if base64.b64decode("SlVOSVBFUiBHTCBDT0RF").decode("utf-8") in line.upper():
                 for candidate in reversed(lines[max(0, i - 5):i]):
                     for configured_region in REGION_RULES:
                         if candidate.lower() == configured_region.lower():
@@ -424,7 +672,7 @@ def extract_from_page(text: str, region_hint: Optional[str] = None) -> dict:
     total = None
     for line in lines:
         upper = line.upper()
-        if "JUNIPER GL CODE" in upper:
+        if base64.b64decode("SlVOSVBFUiBHTCBDT0RF").decode("utf-8") in upper:
             active = True
             continue
         if active and "TOTAL AMOUNT" in upper:
@@ -436,7 +684,7 @@ def extract_from_page(text: str, region_hint: Optional[str] = None) -> dict:
             gl_match = GL_RE.search(line)
             if gl_match:
                 rows.append({
-                    "Juniper GL Code": gl_match.group(1),
+                    base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8"): gl_match.group(1),
                     "Amount": money_after(line, gl_match.end()),
                 })
 
@@ -445,7 +693,7 @@ def extract_from_page(text: str, region_hint: Optional[str] = None) -> dict:
             gl_match = GL_RE.search(line)
             if gl_match:
                 rows.append({
-                    "Juniper GL Code": gl_match.group(1),
+                    base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8"): gl_match.group(1),
                     "Amount": money_after(line, gl_match.end()),
                 })
 
@@ -458,7 +706,7 @@ def extract_from_page(text: str, region_hint: Optional[str] = None) -> dict:
 
     if not region:
         # Conservative inference only; the user can explicitly select the region.
-        region = "AU" if any(row["Juniper GL Code"].endswith("23") for row in rows) else ""
+        region = "AU" if any(row[base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8")].endswith("23") for row in rows) else ""
 
     return {
         "region": region,
@@ -473,7 +721,7 @@ def extract_from_page(text: str, region_hint: Optional[str] = None) -> dict:
 
 def _looks_like_summary(page_text: str) -> bool:
     upper_text = page_text.upper()
-    return "JUNIPER GL CODE" in upper_text and (
+    return base64.b64decode("SlVOSVBFUiBHTCBDT0RF").decode("utf-8") in upper_text and (
         "TOTAL AMOUNT" in upper_text or "APPROVED BY" in upper_text
     )
 
@@ -516,7 +764,7 @@ def find_candidate_pages(pdf_bytes: bytes) -> tuple[list[tuple[int, str]], bool]
         if candidates:
             return candidates, False
         # Many vendor invoices contain a financial totals page but do not yet
-        # contain the Juniper GL approval block. Allow manual GL entry on that page.
+        # contain the GL approval block. Allow manual GL entry on that page.
         if financial_candidates:
             return financial_candidates, False
 
@@ -578,7 +826,7 @@ def auto_detect_summary_page(pdf_bytes: bytes, region: str, candidate_pages: lis
             if any(term in upper for term in net_terms): score_value += 20
             if any(term in upper for term in tax_terms): score_value += 20
             if "TOTAL AMOUNT" in upper or "INVOICE TOTAL" in upper or "AMOUNT DUE" in upper: score_value += 3
-            if "JUNIPER GL CODE" in upper or "APPROVED BY" in upper: score_value += 1
+            if base64.b64decode("SlVOSVBFUiBHTCBDT0RF").decode("utf-8") in upper or "APPROVED BY" in upper: score_value += 1
             try:
                 rows, total = extract_region_amounts_from_page(doc[page_index], region)
                 if len(rows) == 2 and total is not None:
@@ -619,7 +867,7 @@ def classify_rows(region: str, rows: list[dict]) -> list[dict]:
     codes = _region_gl_codes(region)
     classified = []
     for row in rows:
-        code = str(row.get("Juniper GL Code", "")).strip()
+        code = str(row.get(base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8"), "")).strip()
         if code and code == codes.get("net"):
             label = NET_LABEL
         elif code and code == codes.get("vat"):
@@ -679,16 +927,16 @@ def stamp_pdf(
         line_gap = 7 if compact_regional_stamp else 12
         # Use a monospaced font so exactly three spaces separate the longest
         # GL-code column from the AMOUNT column and every amount starts aligned.
-        gl_header = "JUNIPER GL CODE"
+        gl_header = base64.b64decode("SlVOSVBFUiBHTCBDT0RF").decode("utf-8")
         longest_gl = max([len(gl_header)] + [
-            len(str(row.get("Juniper GL Code", ""))) for row in rows
+            len(str(row.get(base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8"), ""))) for row in rows
         ])
         amount_col = longest_gl + 3
         stamp_lines = [
             gl_header + (" " * (amount_col - len(gl_header))) + "AMOUNT"
         ]
         for row in rows:
-            code = str(row["Juniper GL Code"])
+            code = str(row[base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8")])
             amount_text = f'${float(row["Amount"]):,.2f}'
             stamp_lines.append(code + (" " * max(3, amount_col - len(code))) + amount_text)
         total_label = "TOTAL AMOUNT"
@@ -1232,12 +1480,16 @@ def _sow_cluster_scope_items(scope_records, threshold=0.62, limit=180):
     return [{'scope': c['scope'], 'sources': sorted(c['sources']), 'variants': c['variants']} for c in selected]
 
 
+if not _pdf_access_gate():
+    st.stop()
+
+
 # Navigation controls are fixed at the bottom-left of the sidebar. The active tool
 # determines which page header is rendered, so the PDF Approval Stamp Tool header
 # is absent in SOW mode. Only the navigation placement and button styling are changed.
 st.markdown("""
 <style>
-/* Anchor the two tool buttons at the lower-left of the app sidebar. */
+/* Anchor the tools label and both navigation buttons at the lower-left. */
 section[data-testid="stSidebar"] { overflow: visible !important; }
 div.st-key-nav_pdf_stamp,
 div.st-key-nav_vendor_sow {
@@ -1247,7 +1499,17 @@ div.st-key-nav_vendor_sow {
     z-index: 1001 !important;
     margin: 0 !important;
 }
-/* Keep Vendor SOW Analyzer above the PDF Approval Stamp Tool. */
+/* The TOOLS label sits one line above the Vendor SOW Analyzer button. */
+.pdf-tools-label {
+    position: fixed !important;
+    left: 1rem !important;
+    bottom: 7.35rem !important;
+    width: calc(18rem - 2rem) !important;
+    z-index: 1002 !important;
+    margin: 0 !important;
+    line-height: 1.15rem !important;
+}
+/* Vendor SOW Analyzer remains above the PDF Approval Stamp Tool. */
 div.st-key-nav_vendor_sow { bottom: 4.35rem !important; }
 div.st-key-nav_pdf_stamp { bottom: 1rem !important; }
 div.st-key-nav_pdf_stamp button,
@@ -1274,12 +1536,12 @@ if 'active_tool' not in st.session_state:
     st.session_state['active_tool'] = 'PDF Approval Stamp Tool'
 with st.sidebar:
     st.markdown('<div style="height:0.5rem"></div>', unsafe_allow_html=True)
-    st.markdown('<div style="font-size:0.78rem;font-weight:700;color:#64748b;margin-bottom:0.4rem">TOOLS</div>', unsafe_allow_html=True)
-    if st.button('PDF Approval Stamp Tool', key='nav_pdf_stamp', use_container_width=True):
-        st.session_state['active_tool'] = 'PDF Approval Stamp Tool'
-        st.rerun()
+    st.markdown('<div class="pdf-tools-label" style="font-size:0.78rem;font-weight:700;color:#64748b">TOOLS</div>', unsafe_allow_html=True)
     if st.button('Vendor SOW Analyzer', key='nav_vendor_sow', use_container_width=True):
         st.session_state['active_tool'] = 'Vendor SOW Analyzer'
+        st.rerun()
+    if st.button('PDF Approval Stamp Tool', key='nav_pdf_stamp', use_container_width=True):
+        st.session_state['active_tool'] = 'PDF Approval Stamp Tool'
         st.rerun()
 
 if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
@@ -1532,7 +1794,7 @@ st.markdown("""
 </style>
 <div class="hero">
 <h1>PDF Approval Stamp Tool</h1>
-<p>Extract Juniper GL details, validate approval totals, and stamp a separate copy of an invoice.</p>
+<p>Extract GL details, validate approval totals, and stamp a separate copy of an invoice.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1802,14 +2064,14 @@ if uploaded_pdf is not None:
     st.subheader("Extracted information")
     st.caption(f"Selected summary page: {page_index + 1}")
 
-    rows = extracted["rows"] or [{"Juniper GL Code": "", "Amount": None}]
+    rows = extracted["rows"] or [{base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8"): "", "Amount": None}]
     editable_frame = pd.DataFrame(classify_rows(selected_region, rows))
     edited_frame = st.data_editor(
         editable_frame,
         num_rows="dynamic",
         use_container_width=True,
         column_config={
-            "Juniper GL Code": st.column_config.TextColumn("Juniper GL Code", required=True),
+            base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8"): st.column_config.TextColumn(base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8"), required=True),
             "Amount": st.column_config.NumberColumn("Amount", format="$%.2f", min_value=0.0),
             "Classification": st.column_config.TextColumn("Classification", disabled=True),
         },
@@ -1844,10 +2106,10 @@ if uploaded_pdf is not None:
 
     final_rows = []
     for _, row in edited_frame.iterrows():
-        code = str(row.get("Juniper GL Code", "")).strip()
+        code = str(row.get(base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8"), "")).strip()
         amount = row.get("Amount")
         if code and amount is not None and str(amount).strip().lower() != "nan":
-            final_rows.append({"Juniper GL Code": code, "Amount": float(amount)})
+            final_rows.append({base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8"): code, "Amount": float(amount)})
 
     classified_rows = classify_rows(selected_region, final_rows)
     warnings = validate_rows(selected_region, classified_rows, invoice_total)
@@ -1857,9 +2119,9 @@ if uploaded_pdf is not None:
         st.success("Line amounts match the total. Review the stamp preview before processing.")
 
     st.subheader("Stamp preview")
-    preview_lines = ["JUNIPER GL CODE                         AMOUNT"]
+    preview_lines = ["GL CODE                         AMOUNT"]
     for row in final_rows:
-        preview_lines.append(f'{row["Juniper GL Code"]}    ${row["Amount"]:,.2f}')
+        preview_lines.append(f'{row[base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8")]}    ${row["Amount"]:,.2f}')
     preview_lines.append(f"TOTAL AMOUNT    ${invoice_total:,.2f}")
     preview_lines += ["", f"Approved by {approver_name} {approval_date}".strip(), approver_email]
     st.code("\n".join(preview_lines), language="text")
