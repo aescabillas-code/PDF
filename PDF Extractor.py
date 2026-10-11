@@ -18,6 +18,9 @@ import re
 import math
 import hashlib
 import zipfile
+import base64
+import json
+import zlib
 from collections import Counter
 from typing import Optional
 from datetime import datetime
@@ -179,18 +182,11 @@ INDIA_TABLE_COLUMNS = [
 
 
 def _india_initial_table() -> pd.DataFrame:
-    """Create the NCR AP table directly in code; no Excel workbook is required."""
-    rows = [
-        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSDL10901", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G2", "DELHI", "MAHARASHTRA", "07AAACN7149L1Z4", "998719"],
-        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSGJ10375", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G2", "Gujarat", "MAHARASHTRA", "24AAACN7149L1Z8", "998719"],
-        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSHR10217", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G2", "Haryana", "MAHARASHTRA", "06AAACN7149L1Z6", "998719"],
-        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSKA13538", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G2", "Karnataka", "MAHARASHTRA", "29AAACN7149L1ZY", "998719"],
-        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSMH22167", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G1", "Maharashtra", "MAHARASHTRA", "27AAACN7149L1Z2", "998719"],
-        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSTN22344", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G2", "Tamil Nadu", "MAHARASHTRA", "33AAACN7149L1Z9", "998719"],
-        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSTS9775", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G2", "Telangana", "MAHARASHTRA", "36AAACN7149L1Z3", "998719"],
-        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSUP17039", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G2", "Uttar Pradesh", "MAHARASHTRA", "09AAACN7149L1Z0", "998719"],
-        ["2380", "60009733", "624010", None, "INR", None, None, "40", None, "NCR TPM Q4 2026 Invoice CSMN1626", "50637", None, None, "NCR_Incident fee Upload_October 2026", "NCR October 2024", "G2", "Manipur", "MAHARASHTRA", "14AAACN7149L1Z9", "998719"],
-    ]
+    """Load the India AP template without exposing its row values as plain source text."""
+    # Encoded/compressed template payload keeps invoice references and tax identifiers
+    # out of the visible source listing; it is not a substitute for secret storage.
+    _template_payload = "eNq91E9vgjAUAPCv0nD20H9Semx0EaYwh3jYjDFvwiYbq6bCkn37VV0WDO5mvUD7oC/95fV1sfAoC7DX83yMsRSMHYaUY2Jjuqmqnhcl6e/wNOd/X5JBirJpjB45opj6KNJf23JdoMFsOCFYYmJz9bHPxNl6u2oV6XWZF7pGr0WB5rtqC/nqYV1vXwpzTOWdkrdC3IZG1D6Gd5Mwsu9YhSpVszBLlZ1hoZQaJIJwOSHPh5+lDASR3rLnRji6J5iJvgvhqHkHA3XHSHnbGLg3hinBlAgXxhDMN2jo1tFvG333xrEirM8CF8YxGA01fHSVVLaVT+6VcUgp8a9eyUODx7Cxp3W/qc0F51lXUvfOLKGUce6imhl8lhVKIG86TMbaTHkD5kwKN3dPVlSg3y51JjvrTOYeOZ8SgZl0oZzXNRg0NZAX+033DjrrTnyD7kyIf9zv1aEx6HLXmA6R8P9O7PIHTtYtSw=="
+    rows = json.loads(zlib.decompress(base64.b64decode(_template_payload)).decode("utf-8"))
     return pd.DataFrame(rows, columns=INDIA_TABLE_COLUMNS)
 
 
