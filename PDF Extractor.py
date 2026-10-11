@@ -1285,6 +1285,8 @@ def _sow_read_document(name, data):
     if suffix == '.pdf':
         doc = pymupdf.open(stream=data, filetype='pdf')
         try:
+            if doc.needs_pass:
+                raise ValueError('Password-protected PDF; remove the password or provide an unlocked copy.')
             pages = [page.get_text('text') for page in doc]
             text_value = '\n'.join(pages)
             # OCR is a fallback only for genuinely text-poor/scanned PDFs.
@@ -1367,8 +1369,12 @@ def _sow_expand_uploads(uploads, return_errors=False):
                         if item.flag_bits & 0x1:
                             processing_errors.append({'File': f'{name} / {inner_name}', 'Reason': 'Password-protected archive entry; skipped.'})
                             continue
-                        if item.file_size > SOW_MAX_TOTAL_BYTES or total_bytes + item.file_size > SOW_MAX_TOTAL_BYTES:
-                            raise ValueError('The expanded upload exceeds the 100 MB processing limit.')
+                        # Enforce the expanded-size limit on actual document payloads
+                        # inside add_document(), not on a nested ZIP container itself.
+                        # Counting both a nested archive and its extracted contents caused
+                        # valid batches to hit the 100 MB limit prematurely.
+                        if inner_suffix != '.zip' and item.file_size > SOW_MAX_TOTAL_BYTES:
+                            raise ValueError('A single expanded document exceeds the 100 MB processing limit.')
                         try:
                             with archive.open(item) as handle:
                                 inner_data = handle.read(SOW_MAX_TOTAL_BYTES + 1)
@@ -1728,338 +1734,374 @@ if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
     st.caption('ZIP archives (including nested ZIPs) are expanded in memory. Exact duplicate files are removed. Documents with no detectable supplier are kept separate and clearly labeled for manual review.')
 
     if st.button('Analyze vendor scope', type='primary', use_container_width=True, key='run_sow_analysis'):
+        _sow_run_status = st.empty()
+        _sow_run_status.info('Analysis started — checking uploaded files, expanding archives, and extracting document text…')
         try:
-            parsed_docs, document_errors = _sow_expand_uploads(vendor_files or [], return_errors=True)
-            parsed_vendors_by_key = {}
-            excluded_documents = []
-            for document in parsed_docs:
-                text_value = document['Text']
-                base_name = document['File'].rsplit('/', 1)[-1]
-                lower_name = base_name.lower()
-                if ('gp_manual' in lower_name or 'shift resume' in lower_name or 'staff roster' in lower_name or 'summary english' in lower_name):
-                    excluded_documents.append({'File': document['File'], 'Reason': 'Reference, summary, or staffing document; not counted as a separate vendor.'})
-                    continue
-                scope_lines = _sow_extract_scope(text_value)
-                if not scope_lines:
-                    excluded_documents.append({'File': document['File'], 'Reason': 'No usable operational scope clauses were detected.'})
-                    continue
-                vendor_name = _sow_infer_vendor(document['File'], text_value)
-                vendor_key = _sow_normalize(vendor_name)
-                if vendor_key not in parsed_vendors_by_key:
-                    parsed_vendors_by_key[vendor_key] = {'Vendor': vendor_name, 'Files': [], 'Texts': [], 'Scopes': [], 'Hashes': set()}
-                grouped = parsed_vendors_by_key[vendor_key]
-                grouped['Files'].append(document['File'])
-                grouped['Texts'].append(text_value)
-                grouped['Scopes'].extend(scope_lines)
-                grouped['Hashes'].add(document['SHA256'])
-
-            parsed_vendors = []
-            for grouped in parsed_vendors_by_key.values():
-                unique_scopes, seen_scopes = [], set()
-                for scope in grouped['Scopes']:
-                    key = _sow_normalize(scope)
-                    if key and key not in seen_scopes:
-                        seen_scopes.add(key)
-                        unique_scopes.append(scope)
-                parsed_vendors.append({
-                    'Vendor': grouped['Vendor'],
-                    'File': '; '.join(grouped['Files']),
-                    'Files': grouped['Files'],
-                    'Text': '\n\n'.join(grouped['Texts']),
-                    'Scopes': unique_scopes,
-                    'Coverage area': _sow_detect_coverage_area(grouped['Files'], '\n'.join(grouped['Texts'])),
-                })
-
-            if baseline_file is not None:
-                baseline_docs, baseline_errors = _sow_expand_uploads([baseline_file], return_errors=True)
-                document_errors.extend(baseline_errors)
-            else:
-                baseline_docs = []
-            baseline_text = '\n\n'.join(item['Text'] for item in baseline_docs)
-            baseline_scopes = _sow_extract_scope(baseline_text) if baseline_text.strip() else []
-            if document_errors:
-                with st.expander(f'Documents skipped or needing review ({len(document_errors)})', expanded=True):
-                    st.dataframe(pd.DataFrame(document_errors), use_container_width=True, hide_index=True)
-            if len(parsed_vendors) < 2:
-                st.error('Fewer than two distinct readable vendor groups were found. Review the skipped-document list above, confirm the ZIP is not password-protected, and ensure required document-reader packages are installed.')
-            else:
-                if baseline_scopes:
-                    baseline_records = [{'vendor': 'Global baseline', 'scope': scope} for scope in baseline_scopes]
-                    clustered = _sow_cluster_scope_items(baseline_records, threshold=0.74, limit=180)
-                    scope_items = [item['scope'] for item in clustered]
-                    scope_sources = [set() for _ in scope_items]
-                    analysis_mode = 'Global baseline comparison'
+            with st.spinner('Analyzing vendor SOWs — reading documents, matching scope, evaluating Gate 1, and calculating Gate 2 scores…'):
+                parsed_docs, document_errors = _sow_expand_uploads(vendor_files or [], return_errors=True)
+                parsed_vendors_by_key = {}
+                excluded_documents = []
+                for document in parsed_docs:
+                    text_value = document['Text']
+                    base_name = document['File'].rsplit('/', 1)[-1]
+                    lower_name = base_name.lower()
+                    if ('gp_manual' in lower_name or 'shift resume' in lower_name or 'staff roster' in lower_name or 'summary english' in lower_name):
+                        excluded_documents.append({'File': document['File'], 'Reason': 'Reference, summary, or staffing document; not counted as a separate vendor.'})
+                        continue
+                    scope_lines = _sow_extract_scope(text_value)
+                    if not scope_lines:
+                        excluded_documents.append({'File': document['File'], 'Reason': 'No usable operational scope clauses were detected.'})
+                        continue
+                    vendor_name = _sow_infer_vendor(document['File'], text_value)
+                    vendor_key = _sow_normalize(vendor_name)
+                    if vendor_key not in parsed_vendors_by_key:
+                        parsed_vendors_by_key[vendor_key] = {'Vendor': vendor_name, 'Files': [], 'Texts': [], 'Scopes': [], 'Hashes': set()}
+                    grouped = parsed_vendors_by_key[vendor_key]
+                    grouped['Files'].append(document['File'])
+                    grouped['Texts'].append(text_value)
+                    grouped['Scopes'].extend(scope_lines)
+                    grouped['Hashes'].add(document['SHA256'])
+    
+                parsed_vendors = []
+                for grouped in parsed_vendors_by_key.values():
+                    unique_scopes, seen_scopes = [], set()
+                    for scope in grouped['Scopes']:
+                        key = _sow_normalize(scope)
+                        if key and key not in seen_scopes:
+                            seen_scopes.add(key)
+                            unique_scopes.append(scope)
+                    parsed_vendors.append({
+                        'Vendor': grouped['Vendor'],
+                        'File': '; '.join(grouped['Files']),
+                        'Files': grouped['Files'],
+                        'Text': '\n\n'.join(grouped['Texts']),
+                        'Scopes': unique_scopes,
+                        'Coverage area': _sow_detect_coverage_area(grouped['Files'], '\n'.join(grouped['Texts'])),
+                    })
+    
+                if baseline_file is not None:
+                    baseline_docs, baseline_errors = _sow_expand_uploads([baseline_file], return_errors=True)
+                    document_errors.extend(baseline_errors)
                 else:
-                    scope_records = [{'vendor': vendor['Vendor'], 'scope': scope} for vendor in parsed_vendors for scope in vendor['Scopes']]
-                    clustered = _sow_cluster_scope_items(scope_records, threshold=0.74, limit=180)
-                    scope_items = [item['scope'] for item in clustered]
-                    scope_sources = [set(item['sources']) for item in clustered]
-                    analysis_mode = 'Cross-vendor overlap (no global baseline)'
-
-                if not scope_items:
-                    st.error('No usable scope statements were detected. Upload readable SOWs or capability documents with selectable text.')
+                    baseline_docs = []
+                baseline_text = '\n\n'.join(item['Text'] for item in baseline_docs)
+                baseline_scopes = _sow_extract_scope(baseline_text) if baseline_text.strip() else []
+                if document_errors:
+                    with st.expander(f'Documents skipped or needing review ({len(document_errors)})', expanded=True):
+                        st.dataframe(pd.DataFrame(document_errors), use_container_width=True, hide_index=True)
+                if len(parsed_vendors) < 2:
+                    st.error('Fewer than two distinct readable vendor groups were found. Review the skipped-document list above, confirm the ZIP is not password-protected, and ensure required document-reader packages are installed.')
                 else:
-                    per_vendor = {}
-                    all_evidence_rows = []
-                    for vendor in parsed_vendors:
-                        covered, potential, evidence_rows = set(), set(), []
-                        for i, scope in enumerate(scope_items):
-                            score, terms = _sow_similarity(scope, vendor['Scopes'])
-                            phrase = _sow_normalize(scope)
-                            vendor_norm = _sow_normalize(vendor['Text'])
-                            phrase_present = bool(phrase and phrase in vendor_norm)
-                            if vendor['Vendor'] in scope_sources[i]:
-                                status, score = 'Covered', max(score, 100.0)
-                            else:
-                                status = 'Covered' if phrase_present or score >= 60 else ('Potential' if score >= 30 else 'Gap')
-                            if status == 'Covered':
-                                covered.add(i)
-                            elif status == 'Potential':
-                                potential.add(i)
-                            evidence = ''
-                            if vendor['Scopes']:
-                                best_score = -1
-                                for candidate_line in vendor['Scopes']:
-                                    candidate_score, _ = _sow_similarity(scope, [candidate_line])
-                                    if candidate_score > best_score:
-                                        best_score, evidence = candidate_score, candidate_line
-                            if not evidence or status == 'Gap':
-                                evidence = 'No close scope excerpt found; manually review the source document.'
-                            evidence_rows.append({
-                                'Scope requirement': _sow_scope_label(scope),
-                                'Vendor': vendor['Vendor'],
-                                'Status': status,
-                                'Match score (%)': score,
-                                'Matched terms': ', '.join(terms[:12]),
-                                'Evidence excerpt': evidence[:500],
-                                'Source document(s)': vendor['File'],
+                    if baseline_scopes:
+                        baseline_records = [{'vendor': 'Global baseline', 'scope': scope} for scope in baseline_scopes]
+                        clustered = _sow_cluster_scope_items(baseline_records, threshold=0.74, limit=180)
+                        scope_items = [item['scope'] for item in clustered]
+                        scope_sources = [set() for _ in scope_items]
+                        analysis_mode = 'Global baseline comparison'
+                    else:
+                        scope_records = [{'vendor': vendor['Vendor'], 'scope': scope} for vendor in parsed_vendors for scope in vendor['Scopes']]
+                        clustered = _sow_cluster_scope_items(scope_records, threshold=0.74, limit=180)
+                        scope_items = [item['scope'] for item in clustered]
+                        scope_sources = [set(item['sources']) for item in clustered]
+                        analysis_mode = 'Cross-vendor overlap (no global baseline)'
+    
+                    if not scope_items:
+                        st.error('No usable scope statements were detected. Upload readable SOWs or capability documents with selectable text.')
+                    else:
+                        per_vendor = {}
+                        all_evidence_rows = []
+                        for vendor in parsed_vendors:
+                            covered, potential, evidence_rows = set(), set(), []
+                            for i, scope in enumerate(scope_items):
+                                score, terms = _sow_similarity(scope, vendor['Scopes'])
+                                phrase = _sow_normalize(scope)
+                                vendor_norm = _sow_normalize(vendor['Text'])
+                                phrase_present = bool(phrase and phrase in vendor_norm)
+                                if vendor['Vendor'] in scope_sources[i]:
+                                    status, score = 'Covered', max(score, 100.0)
+                                else:
+                                    status = 'Covered' if phrase_present or score >= 60 else ('Potential' if score >= 30 else 'Gap')
+                                if status == 'Covered':
+                                    covered.add(i)
+                                elif status == 'Potential':
+                                    potential.add(i)
+                                evidence = ''
+                                if vendor['Scopes']:
+                                    best_score = -1
+                                    for candidate_line in vendor['Scopes']:
+                                        candidate_score, _ = _sow_similarity(scope, [candidate_line])
+                                        if candidate_score > best_score:
+                                            best_score, evidence = candidate_score, candidate_line
+                                if not evidence or status == 'Gap':
+                                    evidence = 'No close scope excerpt found; manually review the source document.'
+                                evidence_rows.append({
+                                    'Scope requirement': _sow_scope_label(scope),
+                                    'Vendor': vendor['Vendor'],
+                                    'Status': status,
+                                    'Match score (%)': score,
+                                    'Matched terms': ', '.join(terms[:12]),
+                                    'Evidence excerpt': evidence[:500],
+                                    'Source document(s)': vendor['File'],
+                                })
+                            n = max(len(scope_items), 1)
+                            weighted_coverage = round((len(covered) + 0.5 * len(potential)) / n * 100, 1)
+                            scores = [r['Match score (%)'] for r in evidence_rows]
+                            per_vendor[vendor['Vendor']] = {
+                                'covered': covered,
+                                'potential': potential,
+                                'weighted_coverage': weighted_coverage,
+                                'average': round(sum(scores) / len(scores), 1) if scores else 0,
+                                'evidence': evidence_rows,
+                                'file': vendor['File'],
+                                'scope_count': len(vendor['Scopes']),
+                                'coverage_area': vendor.get('Coverage area', 'Not established from document title'),
+                                'full_text': vendor.get('Text', ''),
+                            }
+                            all_evidence_rows.extend(evidence_rows)
+    
+                        # Gate 1: distinguish explicit disqualifiers from missing evidence.
+                        # An absent clause is not treated as proof of non-compliance.
+                        gate_rows = []
+                        score_rows = []
+                        for vendor_name, detail in per_vendor.items():
+                            text_norm = re.sub(r'\s+', ' ', detail.get('full_text', '')).lower()
+                            region_patterns = {
+                                'Americas': r'\b(americas|north america|south america|latin america|latam|united states|canada|brazil|mexico)\b',
+                                'EMEA': r'\b(emea|europe|middle east|africa|united kingdom|uk|germany|france)\b',
+                                'APAC': r'\b(apac|asia pacific|asia-pacific|asia|pacific|australia|india|japan|singapore)\b',
+                            }
+                            region_found = {region: bool(re.search(pattern, text_norm, re.I)) for region, pattern in region_patterns.items()}
+                            regional_text = ', '.join(k for k, found in region_found.items() if found) or 'Not evidenced'
+                            explicit_region_fail = any(re.search(
+                                rf'\b(?:does not|cannot|unable to|do not|not able to|no coverage in|excluded from)\b.{{0,55}}\b{region.lower()}\b',
+                                text_norm, re.I
+                            ) for region in ('Americas', 'EMEA', 'APAC'))
+                            compliance_terms = ['iso 27001', 'iso27001', 'soc 2', 'soc2', 'data residency', 'data sovereignty',
+                                                'gdpr', 'regional labor', 'labour compliance', 'security controls', 'security compliance']
+                            compliance_hits = [term for term in compliance_terms if term in text_norm]
+                            compliance_neg = bool(re.search(r'(not certified|certification expired|does not comply|non-compliant|not compliant|fails? to meet)', text_norm, re.I))
+                            core_terms = ['service desk', 'technical support', 'incident management', 'request fulfillment',
+                                          'field service', 'onsite support', 'remote support', 'service delivery',
+                                          'operations support', 'managed services', 'scope of services']
+                            core_hits = [term for term in core_terms if term in text_norm]
+                            global_terms = ['direct presence', 'owned entity', 'local entity', 'follow-the-sun', 'follow the sun',
+                                            '24/7', '24x7', 'multilingual', 'in-country', 'in country']
+                            global_hits = [term for term in global_terms if term in text_norm]
+                            fail_reasons = []
+                            if explicit_region_fail:
+                                fail_reasons.append('Geographic footprint: explicit regional coverage limitation')
+                            if compliance_neg:
+                                fail_reasons.append('Compliance/security: explicit non-compliance or certification failure')
+                            geography_gate = 'Fail' if explicit_region_fail else ('Pass' if all(region_found.values()) else 'Review')
+                            core_gate = 'Pass' if core_hits else 'Review'
+                            compliance_gate = 'Fail' if compliance_neg else ('Pass' if compliance_hits else 'Review')
+                            gate_status = 'Fail' if fail_reasons else (
+                                'Pass' if geography_gate == 'Pass' and core_gate == 'Pass' and compliance_gate == 'Pass' else 'Review'
+                            )
+                            gate_reason = '; '.join(fail_reasons) if fail_reasons else (
+                                'All non-negotiable evidence categories found' if gate_status == 'Pass'
+                                else 'Review the gate categories marked Review; missing evidence is not proof of failure'
+                            )
+                            gate_rows.append({
+                                'Vendor': vendor_name,
+                                'Geographic footprint gate': geography_gate,
+                                'Core capability gate': core_gate,
+                                'Compliance/security gate': compliance_gate,
+                                'Regional coverage evidence': regional_text,
+                                'Core scope evidence': ', '.join(core_hits[:5]) if core_hits else 'Not evidenced',
+                                'Compliance evidence': ', '.join(compliance_hits[:5]) if compliance_hits else 'Not evidenced',
+                                'Gate 1 status': gate_status,
+                                'Gate 1 knockout reason': '; '.join(fail_reasons) if fail_reasons else ('None detected' if gate_status == 'Pass' else 'No explicit knockout; evidence review required'),
+                                'Gate rationale': gate_reason,
                             })
-                        n = max(len(scope_items), 1)
-                        weighted_coverage = round((len(covered) + 0.5 * len(potential)) / n * 100, 1)
-                        scores = [r['Match score (%)'] for r in evidence_rows]
-                        per_vendor[vendor['Vendor']] = {
-                            'covered': covered,
-                            'potential': potential,
-                            'weighted_coverage': weighted_coverage,
-                            'average': round(sum(scores) / len(scores), 1) if scores else 0,
-                            'evidence': evidence_rows,
-                            'file': vendor['File'],
-                            'scope_count': len(vendor['Scopes']),
-                            'coverage_area': vendor.get('Coverage area', 'Not established from document title'),
-                            'full_text': vendor.get('Text', ''),
-                        }
-                        all_evidence_rows.extend(evidence_rows)
-
-                    # Gate 1: distinguish explicit disqualifiers from missing evidence.
-                    # An absent clause is not treated as proof of non-compliance.
-                    gate_rows = []
-                    score_rows = []
-                    for vendor_name, detail in per_vendor.items():
-                        text_norm = re.sub(r'\s+', ' ', detail.get('full_text', '')).lower()
-                        region_patterns = {
-                            'Americas': r'\b(americas|north america|south america|latin america|latam|united states|canada|brazil|mexico)\b',
-                            'EMEA': r'\b(emea|europe|middle east|africa|united kingdom|uk|germany|france)\b',
-                            'APAC': r'\b(apac|asia pacific|asia-pacific|asia|pacific|australia|india|japan|singapore)\b',
-                        }
-                        region_found = {region: bool(re.search(pattern, text_norm, re.I)) for region, pattern in region_patterns.items()}
-                        regional_text = ', '.join(k for k, found in region_found.items() if found) or 'Not evidenced'
-                        explicit_region_fail = any(re.search(
-                            rf'\b(?:does not|cannot|unable to|do not|not able to|no coverage in|excluded from)\b.{{0,55}}\b{region.lower()}\b',
-                            text_norm, re.I
-                        ) for region in ('Americas', 'EMEA', 'APAC'))
-                        compliance_terms = ['iso 27001', 'iso27001', 'soc 2', 'soc2', 'data residency', 'data sovereignty',
-                                            'gdpr', 'regional labor', 'labour compliance', 'security controls', 'security compliance']
-                        compliance_hits = [term for term in compliance_terms if term in text_norm]
-                        compliance_neg = bool(re.search(r'(not certified|certification expired|does not comply|non-compliant|not compliant|fails? to meet)', text_norm, re.I))
-                        core_terms = ['service desk', 'technical support', 'incident management', 'request fulfillment',
-                                      'field service', 'onsite support', 'remote support', 'service delivery',
-                                      'operations support', 'managed services', 'scope of services']
-                        core_hits = [term for term in core_terms if term in text_norm]
-                        global_terms = ['direct presence', 'owned entity', 'local entity', 'follow-the-sun', 'follow the sun',
-                                        '24/7', '24x7', 'multilingual', 'in-country', 'in country']
-                        global_hits = [term for term in global_terms if term in text_norm]
-                        fail_reasons = []
-                        if explicit_region_fail:
-                            fail_reasons.append('Explicit regional coverage limitation detected')
-                        if compliance_neg:
-                            fail_reasons.append('Explicit compliance/certification failure language detected')
-                        gate_status = 'Fail' if fail_reasons else (
-                            'Pass' if all(region_found.values()) and core_hits and compliance_hits else 'Review'
+    
+                            # Four weighted pillars. Indicators are evidence proxies and should be
+                            # validated against the actual SOW, not interpreted as certifications.
+                            reach = min(100.0, (sum(region_found.values()) / 3 * 70) + min(30, len(global_hits) * 7.5))
+                            scope_breadth = min(100.0, detail['weighted_coverage'] * 0.65 + detail['average'] * 0.35)
+                            sla_terms = ['response time', 'resolution time', 'service level', 'sla', 'service credit',
+                                         'service credits', 'penalty', 'penalties', 'business continuity', 'disaster recovery',
+                                         'redundancy', 'escalation', 'availability']
+                            sla_hits = [term for term in sla_terms if term in text_norm]
+                            sla_score = min(100.0, len(sla_hits) / 6 * 100)
+                            commercial_terms = ['hourly rate', 'unit rate', 'rate card', 'pricing', 'commercial model',
+                                                'fixed fee', 'volume discount', 'scalability', 'transition cost',
+                                                'transition fee', 'cost per', 'blended rate']
+                            commercial_hits = [term for term in commercial_terms if term in text_norm]
+                            commercial_score = min(100.0, len(commercial_hits) / 6 * 100)
+                            composite = round(reach * .35 + scope_breadth * .25 + sla_score * .20 + commercial_score * .20, 1)
+                            score_rows.append({
+                                'Vendor': vendor_name,
+                                'Global reach (/100)': round(reach, 1),
+                                'Scope breadth (/100)': round(scope_breadth, 1),
+                                'SLA rigor (/100)': round(sla_score, 1),
+                                'Commercials & scalability (/100)': round(commercial_score, 1),
+                                'Composite score (/100)': composite,
+                                'Gate 1 status': gate_status,
+                                'Regional evidence': regional_text,
+                                'SLA evidence terms': ', '.join(sla_hits[:6]) or 'Not evidenced',
+                                'Commercial evidence terms': ', '.join(commercial_hits[:6]) or 'Not evidenced',
+                            })
+                        gate_frame = pd.DataFrame(gate_rows)
+                        scoring_frame = pd.DataFrame(score_rows)
+                        eligible_names = set(gate_frame.loc[gate_frame['Gate 1 status'] != 'Fail', 'Vendor'])
+                        ranked_vendors = scoring_frame[scoring_frame['Vendor'].isin(eligible_names)].sort_values(
+                            ['Composite score (/100)', 'Scope breadth (/100)', 'Global reach (/100)'],
+                            ascending=False
+                        )['Vendor'].tolist()
+                        primary = ranked_vendors[:3]
+                        backups = ranked_vendors[3:6]
+                        score_rows_by_vendor = {r['Vendor']: r for r in score_rows}
+                        for row in score_rows:
+                            name = row['Vendor']
+                            row['Rank'] = ranked_vendors.index(name) + 1 if name in ranked_vendors else ''
+                            row['Recommended role'] = (
+                                f'Primary {ranked_vendors.index(name)+1}' if name in primary else
+                                f'Backup {ranked_vendors.index(name)-2}' if name in backups else
+                                'Not shortlisted'
+                            )
+                        st.subheader('Analysis overview')
+                        st.info(f'Mode: {analysis_mode}. Distinct scope clauses assessed: {len(scope_items)}. Distinct supplier groups analyzed: {len(parsed_vendors)}. Exact duplicate files are excluded from the count.')
+                        if not baseline_scopes:
+                            st.warning('No global baseline was supplied. This mode measures overlap across the uploaded scope documents; it cannot prove that any single vendor can replace a global provider. Geographic coverage is shown separately and must be validated before treating a candidate as global.')
+                        if any(name.startswith('Unidentified supplier') for name in per_vendor):
+                            st.warning('One or more documents did not identify a legal supplier. These are labeled by document name and may represent a region/template rather than an independent vendor. Verify the supplier identity before using the shortlist.')
+                        if len(parsed_vendors) < 6:
+                            st.warning(f'Only {len(parsed_vendors)} distinct supplier group(s) were identified. The analyzer can recommend up to {len(primary)} primary and {len(backups)} backup candidates; upload additional independent vendor SOWs to reach six.')
+                        if excluded_documents:
+                            with st.expander(f'Reference/admin documents excluded from vendor ranking ({len(excluded_documents)})', expanded=False):
+                                st.dataframe(pd.DataFrame(excluded_documents), use_container_width=True, hide_index=True)
+    
+                        k1, k2, k3, k4 = st.columns(4)
+                        k1.metric('Distinct vendors/groups', len(parsed_vendors))
+                        k2.metric('Scope clusters', len(scope_items))
+                        k3.metric('Primary candidates', len(primary))
+                        k4.metric('Backup candidates', len(backups))
+    
+                        coverage_rows = []
+                        for name, detail in per_vendor.items():
+                            n = max(len(scope_items), 1)
+                            coverage_rows.append({
+                                'Vendor / supplier group': name,
+                                'Coverage area (from document title)': detail['coverage_area'],
+                                'Global coverage evidence': ('Not evidenced — region-specific SOW' if detail['coverage_area'] != 'Not established from document title' else 'Not established; manual verification required'),
+                                'Weighted coverage (%)': detail['weighted_coverage'],
+                                'Confirmed covered (%)': round(100 * len(detail['covered']) / n, 1),
+                                'Potential (%)': round(100 * len(detail['potential']) / n, 1),
+                                'Average match (%)': detail['average'],
+                                'Covered scopes': len(detail['covered']),
+                                'Potential scopes': len(detail['potential']),
+                                'Gap scopes': n - len(detail['covered']) - len(detail['potential']),
+                                'Documents grouped': len(detail['file'].split('; ')),
+                                'Source file(s)': detail['file'],
+                            })
+                        coverage_frame = pd.DataFrame(coverage_rows).sort_values(
+                            ['Weighted coverage (%)', 'Confirmed covered (%)', 'Average match (%)'], ascending=False
                         )
-                        gate_reason = '; '.join(fail_reasons) if fail_reasons else (
-                            'Evidence found for all regions, service scope, and compliance terms' if gate_status == 'Pass'
-                            else 'Verify missing/ambiguous geography, service pillars, and/or compliance evidence'
+                        scoring_frame = pd.DataFrame(score_rows)
+                        coverage_frame = coverage_frame.merge(scoring_frame, left_on='Vendor / supplier group', right_on='Vendor', how='left').drop(columns=['Vendor'])
+                        coverage_frame['Rank'] = coverage_frame['Vendor / supplier group'].map(
+                            {name: idx + 1 for idx, name in enumerate(ranked_vendors)}
                         )
-                        gate_rows.append({
-                            'Vendor': vendor_name,
-                            'Regional coverage evidence': regional_text,
-                            'Core scope evidence': 'Evidence found' if core_hits else 'Not evidenced',
-                            'Compliance evidence': ', '.join(compliance_hits[:5]) if compliance_hits else 'Not evidenced',
-                            'Gate 1 status': gate_status,
-                            'Gate rationale': gate_reason,
-                        })
-
-                        # Four weighted pillars. Indicators are evidence proxies and should be
-                        # validated against the actual SOW, not interpreted as certifications.
-                        reach = min(100.0, (sum(region_found.values()) / 3 * 70) + min(30, len(global_hits) * 7.5))
-                        scope_breadth = min(100.0, detail['weighted_coverage'] * 0.65 + detail['average'] * 0.35)
-                        sla_terms = ['response time', 'resolution time', 'service level', 'sla', 'service credit',
-                                     'service credits', 'penalty', 'penalties', 'business continuity', 'disaster recovery',
-                                     'redundancy', 'escalation', 'availability']
-                        sla_hits = [term for term in sla_terms if term in text_norm]
-                        sla_score = min(100.0, len(sla_hits) / 6 * 100)
-                        commercial_terms = ['hourly rate', 'unit rate', 'rate card', 'pricing', 'commercial model',
-                                            'fixed fee', 'volume discount', 'scalability', 'transition cost',
-                                            'transition fee', 'cost per', 'blended rate']
-                        commercial_hits = [term for term in commercial_terms if term in text_norm]
-                        commercial_score = min(100.0, len(commercial_hits) / 6 * 100)
-                        composite = round(reach * .35 + scope_breadth * .25 + sla_score * .20 + commercial_score * .20, 1)
-                        score_rows.append({
-                            'Vendor': vendor_name,
-                            'Global reach (/100)': round(reach, 1),
-                            'Scope breadth (/100)': round(scope_breadth, 1),
-                            'SLA rigor (/100)': round(sla_score, 1),
-                            'Commercials & scalability (/100)': round(commercial_score, 1),
-                            'Composite score (/100)': composite,
-                            'Gate 1 status': gate_status,
-                            'Regional evidence': regional_text,
-                            'SLA evidence terms': ', '.join(sla_hits[:6]) or 'Not evidenced',
-                            'Commercial evidence terms': ', '.join(commercial_hits[:6]) or 'Not evidenced',
-                        })
-                    gate_frame = pd.DataFrame(gate_rows)
-                    scoring_frame = pd.DataFrame(score_rows)
-                    eligible_names = set(gate_frame.loc[gate_frame['Gate 1 status'] != 'Fail', 'Vendor'])
-                    ranked_vendors = scoring_frame[scoring_frame['Vendor'].isin(eligible_names)].sort_values(
-                        ['Composite score (/100)', 'Scope breadth (/100)', 'Global reach (/100)'],
-                        ascending=False
-                    )['Vendor'].tolist()
-                    primary = ranked_vendors[:3]
-                    backups = ranked_vendors[3:6]
-                    score_rows_by_vendor = {r['Vendor']: r for r in score_rows}
-                    for row in score_rows:
-                        name = row['Vendor']
-                        row['Rank'] = ranked_vendors.index(name) + 1 if name in ranked_vendors else ''
-                        row['Recommended role'] = (
-                            f'Primary {ranked_vendors.index(name)+1}' if name in primary else
-                            f'Backup {ranked_vendors.index(name)-2}' if name in backups else
-                            'Not shortlisted'
-                        )
-                    st.subheader('Analysis overview')
-                    st.info(f'Mode: {analysis_mode}. Distinct scope clauses assessed: {len(scope_items)}. Distinct supplier groups analyzed: {len(parsed_vendors)}. Exact duplicate files are excluded from the count.')
-                    if not baseline_scopes:
-                        st.warning('No global baseline was supplied. This mode measures overlap across the uploaded scope documents; it cannot prove that any single vendor can replace a global provider. Geographic coverage is shown separately and must be validated before treating a candidate as global.')
-                    if any(name.startswith('Unidentified supplier') for name in per_vendor):
-                        st.warning('One or more documents did not identify a legal supplier. These are labeled by document name and may represent a region/template rather than an independent vendor. Verify the supplier identity before using the shortlist.')
-                    if len(parsed_vendors) < 6:
-                        st.warning(f'Only {len(parsed_vendors)} distinct supplier group(s) were identified. The analyzer can recommend up to {len(primary)} primary and {len(backups)} backup candidates; upload additional independent vendor SOWs to reach six.')
-                    if excluded_documents:
-                        with st.expander(f'Reference/admin documents excluded from vendor ranking ({len(excluded_documents)})', expanded=False):
-                            st.dataframe(pd.DataFrame(excluded_documents), use_container_width=True, hide_index=True)
-
-                    k1, k2, k3, k4 = st.columns(4)
-                    k1.metric('Distinct vendors/groups', len(parsed_vendors))
-                    k2.metric('Scope clusters', len(scope_items))
-                    k3.metric('Primary candidates', len(primary))
-                    k4.metric('Backup candidates', len(backups))
-
-                    coverage_rows = []
-                    for name, detail in per_vendor.items():
-                        n = max(len(scope_items), 1)
-                        coverage_rows.append({
-                            'Vendor / supplier group': name,
-                            'Coverage area (from document title)': detail['coverage_area'],
-                            'Global coverage evidence': ('Not evidenced — region-specific SOW' if detail['coverage_area'] != 'Not established from document title' else 'Not established; manual verification required'),
-                            'Weighted coverage (%)': detail['weighted_coverage'],
-                            'Confirmed covered (%)': round(100 * len(detail['covered']) / n, 1),
-                            'Potential (%)': round(100 * len(detail['potential']) / n, 1),
-                            'Average match (%)': detail['average'],
-                            'Covered scopes': len(detail['covered']),
-                            'Potential scopes': len(detail['potential']),
-                            'Gap scopes': n - len(detail['covered']) - len(detail['potential']),
-                            'Documents grouped': len(detail['file'].split('; ')),
-                            'Source file(s)': detail['file'],
-                        })
-                    coverage_frame = pd.DataFrame(coverage_rows).sort_values(
-                        ['Weighted coverage (%)', 'Confirmed covered (%)', 'Average match (%)'], ascending=False
-                    )
-                    scoring_frame = pd.DataFrame(score_rows)
-                    coverage_frame = coverage_frame.merge(scoring_frame, left_on='Vendor / supplier group', right_on='Vendor', how='left').drop(columns=['Vendor'])
-                    coverage_frame['Rank'] = coverage_frame['Vendor / supplier group'].map(
-                        {name: idx + 1 for idx, name in enumerate(ranked_vendors)}
-                    )
-                    coverage_frame['Recommended role'] = coverage_frame['Vendor / supplier group'].map(
-                        {name: (f'Primary {idx+1}' if idx < 3 else f'Backup {idx-2}' if idx < 6 else 'Not shortlisted')
-                         for idx, name in enumerate(ranked_vendors)}
-                    ).fillna('Knocked out — Gate 1')
-                    st.subheader('Gate 1 — Non-negotiable screening')
-                    st.caption('An explicit disqualifier triggers Fail. Missing or ambiguous evidence is marked Review and must be validated manually; absence from a document is not treated as proof of failure.')
-                    st.dataframe(gate_frame, use_container_width=True, hide_index=True)
-                    st.subheader('Gate 2 — Weighted evaluation matrix')
-                    st.caption('Global reach 35% • Scope breadth 25% • SLA & delivery rigor 20% • Commercials & scalability 20%. Scores are evidence-based screening proxies, not a substitute for contractual validation.')
-                    scoring_display = scoring_frame[['Rank', 'Vendor', 'Gate 1 status', 'Global reach (/100)', 'Scope breadth (/100)', 'SLA rigor (/100)', 'Commercials & scalability (/100)', 'Composite score (/100)', 'Recommended role']].copy()
-                    scoring_display['Rank'] = scoring_display['Rank'].replace('', 'Knocked out')
-                    st.dataframe(scoring_display.sort_values('Composite score (/100)', ascending=False), use_container_width=True, hide_index=True)
-                    st.subheader('Vendor coverage graph')
-                    st.bar_chart(coverage_frame.set_index('Vendor / supplier group')[['Weighted coverage (%)', 'Confirmed covered (%)', 'Potential (%)']], use_container_width=True)
-                    st.caption('Weighted coverage counts each Covered scope as 1 and each Potential scope as 0.5. Confirmed and Potential are shown separately to avoid presenting uncertain matches as proven coverage. Geographic labels are inferred from document titles only; they are not proof of complete country coverage. Similarity is evidence screening, not a contractual conclusion.')
-
-                    st.subheader('Recommended primary vendors')
-                    if primary:
-                        st.dataframe(coverage_frame[coverage_frame['Vendor / supplier group'].isin(primary)], use_container_width=True, hide_index=True)
-                    else:
-                        st.warning('No primary candidates could be selected from the available scope statements.')
-                    st.subheader('Backup vendors')
-                    if backups:
-                        st.dataframe(coverage_frame[coverage_frame['Vendor / supplier group'].isin(backups)], use_container_width=True, hide_index=True)
-                    else:
-                        st.write('No additional distinct vendor groups are available as backups. Upload more independent vendor documents to identify backup options.')
-
-                    st.subheader('Scope-by-vendor comparison matrix')
-                    matrix = pd.DataFrame([{'Scope requirement': _sow_scope_label(scope)} for scope in scope_items])
-                    for name, detail in per_vendor.items():
-                        statuses = {row['Scope requirement']: row['Status'] for row in detail['evidence']}
-                        matrix[name] = [statuses.get(_sow_scope_label(scope), 'Gap') for scope in scope_items]
-                    st.dataframe(matrix, use_container_width=True, hide_index=True)
-
-                    st.subheader('Detailed match evidence')
-                    evidence_frame = pd.DataFrame(all_evidence_rows)
-                    status_filter = st.multiselect('Filter by match status', ['Covered', 'Potential', 'Gap'], default=['Covered', 'Potential', 'Gap'], key='sow_status_filter')
-                    st.dataframe(evidence_frame[evidence_frame['Status'].isin(status_filter)], use_container_width=True, hide_index=True)
-
-                    document_inventory = pd.DataFrame([
-                        {'Document': document['File'], 'Characters extracted': len(document['Text']), 'Scope clauses detected': len(_sow_extract_scope(document['Text'])), 'Supplier detected': _sow_infer_vendor(document['File'], document['Text']), 'Coverage area (from title)': _sow_detect_coverage_area([document['File']], document['Text'])}
-                        for document in parsed_docs
-                    ])
-                    export_buffer = BytesIO()
-                    with pd.ExcelWriter(export_buffer, engine='openpyxl') as writer:
-                        coverage_frame.to_excel(writer, index=False, sheet_name='Vendor Summary')
-                        gate_frame.to_excel(writer, index=False, sheet_name='Gate 1 Screening')
-                        scoring_display.to_excel(writer, index=False, sheet_name='Weighted Evaluation')
-                        matrix.to_excel(writer, index=False, sheet_name='Scope Matrix')
-                        evidence_frame.to_excel(writer, index=False, sheet_name='Match Evidence')
-                        document_inventory.to_excel(writer, index=False, sheet_name='Document Inventory')
-                        pd.DataFrame({
-                            'Primary vendors': primary + [''] * (3 - len(primary)),
-                            'Backup vendors': backups + [''] * (3 - len(backups)),
-                        }).to_excel(writer, index=False, sheet_name='Recommendations')
-                    st.download_button('Download SOW comparison workbook', data=export_buffer.getvalue(), file_name='Vendor_SOW_Analysis.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', use_container_width=True)
-                    pptx_buffer = _sow_build_pptx(
-                        coverage_frame[['Vendor / supplier group', 'Composite score (/100)', 'Gate 1 status', 'Global reach (/100)', 'Scope breadth (/100)', 'SLA rigor (/100)', 'Commercials & scalability (/100)', 'Recommended role']].rename(columns={'Vendor / supplier group': 'Vendor'}),
-                        gate_frame, matrix, analysis_mode, len(scope_items), len(parsed_vendors)
-                    )
-                    st.download_button(
-                        'Download executive PowerPoint (.pptx)',
-                        data=pptx_buffer,
-                        file_name='Global_Vendor_SOW_Executive_Summary.pptx',
-                        mime='application/vnd.openxmlformats-officedocument.presentationml.presentation',
-                        use_container_width=True,
-                    )
-                    st.warning('Before selecting vendors, validate the source clauses for geography/countries, response and resolution SLAs, hours of coverage, onsite/remote requirements, exclusions, dependencies, certifications, subcontracting, and commercial assumptions. The analyzer does not certify legal equivalence.')
+                        coverage_frame['Recommended role'] = coverage_frame['Vendor / supplier group'].map(
+                            {name: (f'Primary {idx+1}' if idx < 3 else f'Backup {idx-2}' if idx < 6 else 'Not shortlisted')
+                             for idx, name in enumerate(ranked_vendors)}
+                        ).fillna('Knocked out — Gate 1')
+                        st.subheader('Gate 1 — Non-Negotiable Knockout Screening (Pass / Fail / Review)')
+                        st.caption('Geographic footprint, core capability, and compliance/security are evaluated separately. Any explicit knockout yields Gate 1 = Fail; missing or ambiguous evidence yields Review, not automatic failure.')
+                        st.dataframe(gate_frame, use_container_width=True, hide_index=True)
+                        st.subheader('Gate 2 — Weighted Multi-Criteria Evaluation (Gate 1 Pass / Review Vendors Only)')
+                        st.caption('Weights: Global reach 35% • Scope breadth 25% • SLA & delivery rigor 20% • Commercials & scalability 20%. Gate 1 Fail vendors are excluded from primary/backup ranking. Scores are evidence-based screening proxies, not a substitute for contractual validation.')
+                        scoring_display = scoring_frame[['Rank', 'Vendor', 'Gate 1 status', 'Global reach (/100)', 'Scope breadth (/100)', 'SLA rigor (/100)', 'Commercials & scalability (/100)', 'Composite score (/100)', 'Recommended role']].copy()
+                        scoring_display.insert(3, 'Gate 2 eligibility', scoring_display['Gate 1 status'].map(
+                            lambda status: 'Eligible for weighted ranking' if status != 'Fail' else 'Excluded — Gate 1 knockout'
+                        ))
+                        scoring_display['Rank'] = scoring_display['Rank'].replace('', 'Knocked out')
+                        st.dataframe(scoring_display.sort_values('Composite score (/100)', ascending=False), use_container_width=True, hide_index=True)
+                        st.subheader('Vendor coverage graph')
+                        st.bar_chart(coverage_frame.set_index('Vendor / supplier group')[['Weighted coverage (%)', 'Confirmed covered (%)', 'Potential (%)']], use_container_width=True)
+                        st.caption('Weighted coverage counts each Covered scope as 1 and each Potential scope as 0.5. Confirmed and Potential are shown separately to avoid presenting uncertain matches as proven coverage. Geographic labels are inferred from document titles only; they are not proof of complete country coverage. Similarity is evidence screening, not a contractual conclusion.')
+    
+                        st.subheader('Recommended primary vendors')
+                        if primary:
+                            st.dataframe(coverage_frame[coverage_frame['Vendor / supplier group'].isin(primary)], use_container_width=True, hide_index=True)
+                        else:
+                            st.warning('No primary candidates could be selected from the available scope statements.')
+                        st.subheader('Backup vendors')
+                        if backups:
+                            st.dataframe(coverage_frame[coverage_frame['Vendor / supplier group'].isin(backups)], use_container_width=True, hide_index=True)
+                        else:
+                            st.write('No additional distinct vendor groups are available as backups. Upload more independent vendor documents to identify backup options.')
+    
+                        st.subheader('Scope-by-vendor comparison matrix')
+                        matrix = pd.DataFrame([{'Scope requirement': _sow_scope_label(scope)} for scope in scope_items])
+                        for name, detail in per_vendor.items():
+                            statuses = {row['Scope requirement']: row['Status'] for row in detail['evidence']}
+                            matrix[name] = [statuses.get(_sow_scope_label(scope), 'Gap') for scope in scope_items]
+                        st.dataframe(matrix, use_container_width=True, hide_index=True)
+    
+                        st.subheader('Detailed match evidence')
+                        evidence_frame = pd.DataFrame(all_evidence_rows)
+                        status_filter = st.multiselect('Filter by match status', ['Covered', 'Potential', 'Gap'], default=['Covered', 'Potential', 'Gap'], key='sow_status_filter')
+                        st.dataframe(evidence_frame[evidence_frame['Status'].isin(status_filter)], use_container_width=True, hide_index=True)
+    
+                        document_inventory = pd.DataFrame([
+                            {'Document': document['File'], 'Characters extracted': len(document['Text']), 'Scope clauses detected': len(_sow_extract_scope(document['Text'])), 'Supplier detected': _sow_infer_vendor(document['File'], document['Text']), 'Coverage area (from title)': _sow_detect_coverage_area([document['File']], document['Text'])}
+                            for document in parsed_docs
+                        ])
+                        export_buffer = BytesIO()
+                        with pd.ExcelWriter(export_buffer, engine='openpyxl') as writer:
+                            coverage_frame.to_excel(writer, index=False, sheet_name='Vendor Summary')
+                            gate_frame.to_excel(writer, index=False, sheet_name='Gate 1 Screening')
+                            scoring_display.to_excel(writer, index=False, sheet_name='Weighted Evaluation')
+                            matrix.to_excel(writer, index=False, sheet_name='Scope Matrix')
+                            evidence_frame.to_excel(writer, index=False, sheet_name='Match Evidence')
+                            document_inventory.to_excel(writer, index=False, sheet_name='Document Inventory')
+                            pd.DataFrame({
+                                'Primary vendors': primary + [''] * (3 - len(primary)),
+                                'Backup vendors': backups + [''] * (3 - len(backups)),
+                            }).to_excel(writer, index=False, sheet_name='Recommendations')
+                        st.download_button('Download SOW comparison workbook', data=export_buffer.getvalue(), file_name='Vendor_SOW_Analysis.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', use_container_width=True)
+                        try:
+                            pptx_summary = coverage_frame[[
+                                'Vendor / supplier group', 'Composite score (/100)', 'Gate 1 status',
+                                'Global reach (/100)', 'Scope breadth (/100)', 'SLA rigor (/100)',
+                                'Commercials & scalability (/100)', 'Recommended role'
+                            ]].rename(columns={
+                                'Vendor / supplier group': 'Vendor',
+                                'Global reach (/100)': 'Global reach',
+                                'Scope breadth (/100)': 'Scope breadth',
+                                'SLA rigor (/100)': 'SLA rigor',
+                                'Commercials & scalability (/100)': 'Commercials',
+                            })
+                            pptx_buffer = _sow_build_pptx(
+                                pptx_summary, gate_frame, matrix, analysis_mode, len(scope_items), len(parsed_vendors)
+                            )
+                            st.download_button(
+                                'Download executive PowerPoint (.pptx)',
+                                data=pptx_buffer,
+                                file_name='Global_Vendor_SOW_Executive_Summary.pptx',
+                                mime='application/vnd.openxmlformats-officedocument.presentationml.presentation',
+                                use_container_width=True,
+                            )
+                        except Exception as pptx_exc:
+                            st.warning('The analysis results and Excel workbook are ready, but the PowerPoint could not be generated. Check that python-pptx is installed and the export columns are available.')
+                            st.caption(f'PowerPoint diagnostic: {type(pptx_exc).__name__}')
+                        st.warning('Before selecting vendors, validate the source clauses for geography/countries, response and resolution SLAs, hours of coverage, onsite/remote requirements, exclusions, dependencies, certifications, subcontracting, and commercial assumptions. The analyzer does not certify legal equivalence.')
+            _sow_run_status.success('Analysis processing finished. Review the Gate 1 screening, Gate 2 weighted results, and download options below.')
         except Exception as exc:
-            # Show technical type and a sanitized short reason, never extracted SOW content.
-            detail = re.sub(r'[\r\n\t]+', ' ', str(exc)).strip()[:240]
-            st.error('The SOW documents could not be analyzed. Check file readability, password protection, required dependencies, and the 100 MB expanded processing limit.')
-            st.caption(f'Technical diagnostic: {type(exc).__name__}' + (f' — {detail}' if detail else ''))
+            # Show a sanitized diagnostic category; never display extracted SOW content.
+            _sow_run_status.error('Analysis stopped because of an actual processing error.')
+            exc_name = type(exc).__name__
+            if isinstance(exc, ValueError) and '100 MB' in str(exc):
+                st.error('The expanded document content exceeds the 100 MB processing limit. Remove large or duplicate files, or split the ZIP into smaller batches.')
+            elif 'password' in str(exc).lower() or 'encrypted' in str(exc).lower():
+                st.error('A password-protected document or archive could not be read. Upload an unlocked copy.')
+            elif exc_name in ('ModuleNotFoundError', 'ImportError'):
+                st.error('A required document-reader or export dependency is missing. Install the packages listed in requirements.txt and restart the app.')
+            else:
+                st.error('The SOW documents could not be analyzed. Check file readability, password protection, required dependencies, and the expanded processing limit.')
+            st.caption(f'Technical diagnostic: {exc_name}')
     st.stop()
 
 st.markdown("""
