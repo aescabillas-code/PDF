@@ -22,6 +22,7 @@ import os
 import zipfile
 import base64
 import json
+import html
 import zlib
 from collections import Counter
 from typing import Optional
@@ -2334,24 +2335,41 @@ if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
                             name: f'V{idx + 1}' for idx, name in enumerate(_matrix_vendor_names)
                         }
                         _matrix_display = matrix.rename(columns=_matrix_aliases).copy()
+                        # Use a single colored square as the status marker; keep
+                        # the textual status in the source matrix and workbook.
                         _matrix_icons = {
-                            'Covered': '🟩 ✓',
-                            'Potential': '🟨 ◐',
-                            'Gap': '🟥 ✕',
+                            'Covered': '🟩',
+                            'Potential': '🟨',
+                            'Gap': '🟥',
                         }
                         for _vendor_name, _alias in _matrix_aliases.items():
                             _matrix_display[_alias] = _matrix_display[_alias].map(
-                                lambda value: _matrix_icons.get(str(value), '⬜ ?')
+                                lambda value: _matrix_icons.get(str(value), '⬜')
                             )
                         st.markdown(
-                            '**Legend:** 🟩 ✓ Covered — evidence found · '
-                            '🟨 ◐ Potential — partial/uncertain match · '
-                            '🟥 ✕ Gap — no sufficient matching evidence · '
-                            '⬜ ? Unclassified — review required'
+                            '<div style="font-size:0.88rem; line-height:1.5; margin:0.2rem 0 0.5rem 0;">'
+                            '<strong>Legend:</strong> '
+                            '<span style="color:#16803d;">🟩</span> Covered — evidence found &nbsp; · &nbsp; '
+                            '<span style="color:#b77900;">🟨</span> Potential — partial/uncertain match &nbsp; · &nbsp; '
+                            '<span style="color:#c62828;">🟥</span> Gap — no sufficient matching evidence &nbsp; · &nbsp; '
+                            '<span style="color:#64748b;">⬜</span> Unclassified — review required'
+                            '</div>',
+                            unsafe_allow_html=True,
                         )
-                        st.caption('Vendor key: ' + '  |  '.join(
-                            f"{_alias} = {_name}" for _name, _alias in _matrix_aliases.items()
-                        ))
+                        # Put each vendor on its own line in a smaller, muted key,
+                        # so long legal names do not run together or widen matrix columns.
+                        _vendor_key_html = ''.join(
+                            '<div style="font-size:0.72rem; line-height:1.35; color:#7b8492; '
+                            'margin:1px 0; overflow-wrap:anywhere;">'
+                            f'<strong>{_alias}</strong> = {html.escape(str(_name))}</div>'
+                            for _name, _alias in _matrix_aliases.items()
+                        )
+                        st.markdown(
+                            '<div style="margin:0.25rem 0 0.65rem 0;">'
+                            '<div style="font-size:0.76rem; color:#7b8492; font-weight:600; margin-bottom:2px;">Vendor key</div>'
+                            + _vendor_key_html + '</div>',
+                            unsafe_allow_html=True,
+                        )
                         _matrix_config = {
                             'Scope requirement': st.column_config.TextColumn('Scope requirement', width='large'),
                         }
