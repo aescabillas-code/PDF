@@ -1089,6 +1089,15 @@ def stamp_pdf(
         else:
             _, y, x = min(candidates, key=lambda item: item[0])
 
+        # Draw a visible border around the complete approval stamp while keeping
+        # the existing placement search and text layout unchanged.
+        stamp_border = pymupdf.Rect(x, y, x + stamp_width, y + stamp_height)
+        page.draw_rect(
+            stamp_border,
+            color=(0, 0, 0),
+            width=0.8,
+            overlay=True,
+        )
         for index, line in enumerate(stamp_lines):
             if line:
                 page.insert_text(
@@ -1873,7 +1882,7 @@ if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
     with st.expander('How the recommendations work', expanded=False):
         st.write('The analyzer extracts text and compares scope terms and evidence statements. It recommends a set of up to 3 primary vendors and up to 3 backups using a coverage-first selection. Similarity is a screening aid, not a contractual determination; verify exclusions, geography, SLAs, staffing, certifications, and commercial terms in the source documents.')
     _sow_file_types = ['pdf','docx','docm','xlsx','xlsm','xls','pptx','txt','md','csv','zip']
-    baseline_file = st.file_uploader('Global vendor SOW / baseline (optional)', type=_sow_file_types, key='sow_baseline')
+    baseline_files = st.file_uploader('Global vendor SOW / baseline (optional — upload multiple files)', type=_sow_file_types, accept_multiple_files=True, key='sow_baseline')
     vendor_files = st.file_uploader('Upload vendor SOWs, capability documents, or a ZIP containing multiple documents', type=_sow_file_types, accept_multiple_files=True, key='sow_vendor_files')
     st.caption('ZIP archives (including nested ZIPs) are expanded in memory. Exact duplicate files are removed. Documents with no detectable supplier are kept separate and clearly labeled for manual review.')
 
@@ -1923,13 +1932,15 @@ if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
                         'Coverage area': _sow_detect_coverage_area(grouped['Files'], '\n'.join(grouped['Texts'])),
                     })
     
-                if baseline_file is not None:
-                    baseline_docs, baseline_errors = _sow_expand_uploads([baseline_file], return_errors=True)
-                    document_errors.extend(baseline_errors)
-                else:
-                    baseline_docs = []
+                # Treat every uploaded baseline document as one reference vendor.
+                # Merge its extracted text and scope clauses so all candidates are
+                # measured against the full global scope/coverage, not just one file.
+                baseline_docs, baseline_errors = _sow_expand_uploads(baseline_files or [], return_errors=True)
+                document_errors.extend(baseline_errors)
                 baseline_text = '\n\n'.join(item['Text'] for item in baseline_docs)
                 baseline_scopes = _sow_extract_scope(baseline_text) if baseline_text.strip() else []
+                if baseline_docs:
+                    st.caption(f'Global baseline loaded: {len(baseline_docs)} readable document(s) combined as the reference scope.')
                 if document_errors:
                     with st.expander(f'Documents skipped or needing review ({len(document_errors)})', expanded=True):
                         st.dataframe(pd.DataFrame(document_errors), use_container_width=True, hide_index=True)
