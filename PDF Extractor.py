@@ -1089,9 +1089,10 @@ def stamp_pdf(
         else:
             _, y, x = min(candidates, key=lambda item: item[0])
 
-        # Draw a visible border around the complete approval stamp while keeping
-        # the existing placement search and text layout unchanged.
-        stamp_border = pymupdf.Rect(x, y, x + stamp_width, y + stamp_height)
+        # End the border one monospaced space after the longest stamp line.
+        # Keep the existing placement search and text layout unchanged.
+        border_right = x + 5 + (longest + 1) * font_size * 0.60
+        stamp_border = pymupdf.Rect(x, y, min(x + stamp_width, border_right), y + stamp_height)
         page.draw_rect(
             stamp_border,
             color=(0, 0, 0),
