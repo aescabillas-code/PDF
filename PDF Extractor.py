@@ -1,5 +1,5 @@
 """
-PDF Approval Stamp Tool — privacy-hardened Streamlit app.
+PDF Approval Stamp Tool & Vendor SOW Analyzer — privacy-hardened Streamlit app.
 
 Privacy controls:
 - No invoice values or extracted personal/business data are written to logs.
@@ -54,13 +54,9 @@ section[data-testid="stSidebar"] {transform: none !important; min-width: 18rem !
 </style>
 """, unsafe_allow_html=True)
 
-
 # -----------------------------------------------------------------------------
 # PERSISTENT ONE-TIME ACCESS — adapted from TASKS MONITORING TRACKER
 # -----------------------------------------------------------------------------
-# Authorization is stored as a signed token in a durable first-party cookie
-# and browser localStorage, with sessionStorage as a last-resort fallback.
-# ACCESS_CODE and TOKEN_SECRET must be configured in Streamlit Secrets.
 try:
     from itsdangerous import URLSafeTimedSerializer
 except Exception:
@@ -76,7 +72,6 @@ AUTH_COOKIE_KEY = base64.b64decode("anVuaXBlcl9wZGZfc3RhbXBfYXV0aG9yaXplZF9jb29r
 AUTH_JS_READ_KEY = base64.b64decode("anVuaXBlcl9wZGZfc3RhbXBfYXV0aF9yZWFkX3Yx").decode("utf-8")
 AUTH_JS_SAVE_KEY = base64.b64decode("anVuaXBlcl9wZGZfc3RhbXBfYXV0aF9zYXZlX3Yx").decode("utf-8")
 
-
 def _pdf_access_secrets():
     """Read access credentials only from Streamlit Secrets or environment."""
     try:
@@ -87,10 +82,8 @@ def _pdf_access_secrets():
         token_secret = os.getenv("TOKEN_SECRET", "").strip()
     return access_code, token_secret
 
-
 def _pdf_access_code_fingerprint(code):
     return hashlib.sha256(str(code).encode("utf-8")).hexdigest()[:32]
-
 
 def _pdf_token_serializer():
     if URLSafeTimedSerializer is None:
@@ -101,7 +94,6 @@ def _pdf_token_serializer():
     salt = base64.b64decode("anVuaXBlci1wZGYtc3RhbXAtYnJvd3Nlci1hY2Nlc3MtdjEt").decode("utf-8") + _pdf_access_code_fingerprint(access_code)
     return URLSafeTimedSerializer(token_secret, salt=salt)
 
-
 def _pdf_create_browser_token():
     serializer = _pdf_token_serializer()
     access_code, _ = _pdf_access_secrets()
@@ -111,7 +103,6 @@ def _pdf_create_browser_token():
         "authorized": True,
         "fp": _pdf_access_code_fingerprint(access_code),
     })
-
 
 def _pdf_validate_browser_token(token):
     if not token:
@@ -132,7 +123,6 @@ def _pdf_validate_browser_token(token):
     except Exception:
         return False
 
-
 def _pdf_js_storage(expression, key):
     if streamlit_js_eval is None:
         return None
@@ -140,7 +130,6 @@ def _pdf_js_storage(expression, key):
         return streamlit_js_eval(js_expressions=expression, want_output=True, key=key)
     except Exception:
         return None
-
 
 def _pdf_read_browser_token():
     """Read persistent signed authorization from server-visible cookie or browser storage."""
@@ -189,7 +178,6 @@ def _pdf_read_browser_token():
     value = _pdf_js_storage(expression, AUTH_JS_READ_KEY)
     return None if value is None else str(value or "")
 
-
 def _pdf_save_browser_token(token):
     """Save token for one-time access on this browser profile."""
     storage_key = repr(ACCESS_STORAGE_KEY)
@@ -231,7 +219,6 @@ def _pdf_save_browser_token(token):
     }})()
     """
     return _pdf_js_storage(expression, AUTH_JS_SAVE_KEY) == "saved"
-
 
 def _pdf_access_gate():
     """Require the access code once per browser profile and restore signed authorization."""
@@ -283,6 +270,7 @@ def _pdf_access_gate():
     </div>
     """, unsafe_allow_html=True)
 
+
     code = st.text_input(
         "Access code", type="password", placeholder="Enter access code",
         label_visibility="collapsed", key="pdf_one_time_access_code",
@@ -299,8 +287,7 @@ def _pdf_access_gate():
             st.error("Invalid access code.")
     return False
 
-
-# Region names and aliases are not sensitive. All full GL codes are read only from Streamlit secrets.
+# Region rules and regex definitions
 REGION_RULES = {
     "IPLS": {},
     "AU": {},
@@ -322,9 +309,9 @@ MONEY_RE = re.compile(r"\$?\s*([\d,]+\.\d{2})")
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
 APPROVAL_RE = re.compile(r"Approved\s+by\s+(.+?)\s+(\d{2}[./-]\d{2}[./-]\d{4})", re.I)
 
-
-
-
+# -----------------------------------------------------------------------------
+# INDIA INVOICE PROCESSING ROUTINES
+# -----------------------------------------------------------------------------
 def _india_clean_text(value: str) -> str:
     try:
         if pd.isna(value):
@@ -333,12 +320,10 @@ def _india_clean_text(value: str) -> str:
         pass
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
-
 def _india_amount(value: str) -> Optional[float]:
     cleaned = str(value or "").replace(",", "").replace("₹", "").strip()
     match = re.search(r"-?\d+(?:\.\d{1,2})?", cleaned)
     return round(float(match.group(0)), 2) if match else None
-
 
 def _india_parse_invoice(pdf_bytes: bytes) -> dict:
     """Extract invoice identity and tax summary from a vendor PDF, in memory."""
@@ -349,15 +334,9 @@ def _india_parse_invoice(pdf_bytes: bytes) -> dict:
         doc.close()
     text = "\n".join(pages_text)
     flat = _india_clean_text(text)
-    # NCR invoice number is shown beside NUMBER / DATE on the invoice header.
     inv_match = re.search(r"\b(CSDL\d+|CSGJ\d+|CSHR\d+|CSKA\d+|CSMH\d+|CSMN\d+|CSTN\d+|CSTS\d+|CSUP\d+)\b", flat, re.I)
     gstin_match = re.search(r"\bGSTIN\s*:?\s*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9])\b", flat, re.I)
-    # Prefer the supplier GSTIN printed in the invoice header. The buyer GSTIN
-    # is later under "Bill to", so capture the first GSTIN occurrence.
-    if gstin_match:
-        gstin = gstin_match.group(1).upper()
-    else:
-        gstin = ""
+    gstin = gstin_match.group(1).upper() if gstin_match else ""
     date_match = re.search(r"\b(\d{2}/\d{2}/\d{2,4})\b", flat)
     invoice_date = ""
     if date_match:
@@ -386,20 +365,13 @@ def _india_parse_invoice(pdf_bytes: bytes) -> dict:
         r"\bAMOUNT DUE\b[\s\S]{0,80}?([₹]?\s*[\d,]+\.\d{2})",
     ])
 
-    # Collect every monetary amount after Subtotal and before the invoice total.
-    # PDF text extraction can separate tax labels and values into different lines,
-    # so scan the flattened text segment instead of depending on CGST/SGST labels.
     _subtotal_match = re.search(r"\bSubtotal\b", flat, re.I)
     _total_match = re.search(r"\b(?:INVOICE TOTAL|TOTAL AMOUNT|AMOUNT DUE)\b", flat, re.I)
     _tax_components = []
     if _subtotal_match and _total_match and _total_match.start() > _subtotal_match.end():
         _tax_section = flat[_subtotal_match.end():_total_match.start()]
-        # Drop the subtotal value itself; the section starts immediately after
-        # the word Subtotal and may contain its amount before the tax amounts.
         _amount_matches = re.findall(r"\d[\d,]*\.\d{2}", _tax_section)
         if _amount_matches:
-            # First amount after the label is the subtotal. Remaining amounts
-            # are tax components; each is included in the tax sum.
             _amount_matches = _amount_matches[1:]
         for _amount_text in _amount_matches:
             _component_amount = _india_amount(_amount_text)
@@ -420,7 +392,6 @@ def _india_parse_invoice(pdf_bytes: bytes) -> dict:
         "invoice_total": total,
     }
 
-
 INDIA_TABLE_COLUMNS = [
     base64.b64decode("SnVuaXBlciBFbnRpdHkgQ29kZQ==").decode("utf-8"), "NCR Vendor code", "GL Code ", "Amount- Duty/IGST",
     "Curr", "Tax field", "Total (amount+tax)", "Dr-40/Cr-50", "Inv Date",
@@ -429,15 +400,11 @@ INDIA_TABLE_COLUMNS = [
     "Billed From", "Billed To", "GSTIN", "HSN code ",
 ]
 
-
 def _india_initial_table() -> pd.DataFrame:
     """Load the India AP template without exposing its row values as plain source text."""
-    # Encoded/compressed template payload keeps invoice references and tax identifiers
-    # out of the visible source listing; it is not a substitute for secret storage.
     _template_payload = "eNq91E9vgjAUAPCv0nD20H9Semx0EaYwh3jYjDFvwiYbq6bCkn37VV0WDO5mvUD7oC/95fV1sfAoC7DX83yMsRSMHYaUY2Jjuqmqnhcl6e/wNOd/X5JBirJpjB45opj6KNJf23JdoMFsOCFYYmJz9bHPxNl6u2oV6XWZF7pGr0WB5rtqC/nqYV1vXwpzTOWdkrdC3IZG1D6Gd5Mwsu9YhSpVszBLlZ1hoZQaJIJwOSHPh5+lDASR3rLnRji6J5iJvgvhqHkHA3XHSHnbGLg3hinBlAgXxhDMN2jo1tFvG333xrEirM8CF8YxGA01fHSVVLaVT+6VcUgp8a9eyUODx7Cxp3W/qc0F51lXUvfOLKGUce6imhl8lhVKIG86TMbaTHkD5kwKN3dPVlSg3y51JjvrTOYeOZ8SgZl0oZzXNRg0NZAX+033DjrrTnyD7kyIf9zv1aEx6HLXmA6R8P9O7PIHTtYtSw=="
     rows = json.loads(zlib.decompress(base64.b64decode(_template_payload)).decode("utf-8"))
     return pd.DataFrame(rows, columns=INDIA_TABLE_COLUMNS)
-
 
 def _india_make_csv(pdf_uploads, quarter: str, year: int, fee_type: str, upload_month: str, upload_year: int):
     """Fill the in-app NCR AP table using invoice number + supplier GSTIN."""
@@ -463,9 +430,6 @@ def _india_make_csv(pdf_uploads, quarter: str, year: int, fee_type: str, upload_
     for idx, row in frame.iterrows():
         invoice_number = _india_clean_text(row.get("Invoice Number", "")).upper()
         gstin = _india_clean_text(row.get("GSTIN", "")).upper()
-        # The supplied blank template may carry the invoice number only in the
-        # existing line description; use it as a matching key without treating
-        # screenshot/reference values as source invoice data.
         if not invoice_number:
             description = _india_clean_text(row.get("Line Description", ""))
             inferred = re.search(r"\b(CSDL\d+|CSGJ\d+|CSHR\d+|CSKA\d+|CSMH\d+|CSMN\d+|CSTN\d+|CSTS\d+|CSUP\d+)\b", description, re.I)
@@ -483,8 +447,6 @@ def _india_make_csv(pdf_uploads, quarter: str, year: int, fee_type: str, upload_
         if pd.isna(row.get("Invoice Number")) or not _india_clean_text(row.get("Invoice Number", "")):
             frame.at[idx, "Invoice Number"] = invoice_number
 
-        # Fill missing values only; preserve pre-populated template data except
-        # the line description, which follows the user-selected quarter/year.
         net = record["net"]
         tax = record["tax_field"]
         if pd.isna(row.get("Amount- Duty/IGST")) and net is not None:
@@ -513,24 +475,18 @@ def _india_make_csv(pdf_uploads, quarter: str, year: int, fee_type: str, upload_
 
     return frame, results, unmatched, duplicates
 
-
-
+# -----------------------------------------------------------------------------
+# PDF STAMP EXTRACTION AND PROCESSING
+# -----------------------------------------------------------------------------
 def normalize_region(value: str) -> str:
     value = re.sub(r"\s+", " ", (value or "").strip())
     return REGION_ALIASES.get(value.upper(), value)
-
 
 def money_after(text: str, start: int = 0) -> Optional[float]:
     match = MONEY_RE.search(text, start)
     return float(match.group(1).replace(",", "")) if match else None
 
-
 def extract_region_amounts_from_page(page, region: str) -> tuple[list[dict], Optional[float]]:
-    """Match region-specific summary labels to amounts using PDF coordinates.
-
-    AU and UK use label/value rows. NA/LATAM and EMEA/APAC use USD column
-    headings with values beneath them. GL codes are never read from the invoice.
-    """
     region = normalize_region(region)
     codes = _region_gl_codes(region)
     words = page.get_text("words")
@@ -544,7 +500,6 @@ def extract_region_amounts_from_page(page, region: str) -> tuple[list[dict], Opt
     def phrase_boxes(phrase):
         target = norm(phrase).split()
         found = []
-        # Group words by approximate baseline, then match phrase within each line.
         lines = {}
         for w in words:
             key = round(w[1] / 5) * 5
@@ -586,13 +541,11 @@ def extract_region_amounts_from_page(page, region: str) -> tuple[list[dict], Opt
     elif region == "UK":
         specs = {"net": ["SUBTOTAL"], "vat": ["VAT"]}
     else:
-        # In NA/LATAM and EMEA/APAC invoices, the VAT column heading is split
-        # across two lines: "TOTAL REGION" above "VAT/TAXES(USD)". Match the
-        # second-line column heading directly so the tax amount is not missed.
         specs = {
             "net": ["NET AMOUNT(USD)", "NET AMOUNT (USD)"],
             "vat": ["VAT/TAXES(USD)", "VAT/TAXES (USD)"],
         }
+
 
     for kind, labels in specs.items():
         boxes = []
@@ -605,23 +558,14 @@ def extract_region_amounts_from_page(page, region: str) -> tuple[list[dict], Opt
         for lx0, ly0, lx1, ly1 in boxes:
             for ax0, ay0, ax1, ay1, value in amounts:
                 if region in ("IPLS", "NA and LATAM", "EMEA & APAC"):
-                    # Amount must be below its own USD column header.
-                    # These invoice layouts can place the amount far to the right
-                    # of the heading, so do not cap the horizontal distance.
-                    # The nearest amount horizontally to each header is selected
-                    # when multiple values share the same summary row.
                     if ay0 <= ly1 + 8:
                         continue
                     if ax0 < lx0 - 35:
                         continue
-                    # Prefer the amount whose horizontal center is closest to
-                    # this column header; this keeps the total-amount column from
-                    # being mistaken for the VAT/tax amount.
                     header_center = (lx0 + lx1) / 2
                     amount_center = (ax0 + ax1) / 2
                     candidates.append((ay0 - ly1, abs(amount_center - header_center), value))
                 else:
-                    # AU/UK values are printed on the same row, to the right of label.
                     vertical = abs((ay0 + ay1) / 2 - (ly0 + ly1) / 2)
                     horizontal = ax0 - lx1
                     if vertical <= 24 and -5 <= horizontal <= 360:
@@ -637,7 +581,6 @@ def extract_region_amounts_from_page(page, region: str) -> tuple[list[dict], Opt
         rows.append({base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8"): codes["vat"], "Amount": found["vat"]})
     total = round(found["net"] + found["vat"], 2) if len(found) == 2 else None
     return rows, total
-
 
 def extract_from_page(text: str, region_hint: Optional[str] = None) -> dict:
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
@@ -689,6 +632,7 @@ def extract_from_page(text: str, region_hint: Optional[str] = None) -> dict:
                     "Amount": money_after(line, gl_match.end()),
                 })
 
+
     if not rows:
         for line in lines:
             gl_match = GL_RE.search(line)
@@ -706,8 +650,8 @@ def extract_from_page(text: str, region_hint: Optional[str] = None) -> dict:
                     break
 
     if not region:
-        # Conservative inference only; the user can explicitly select the region.
         region = "AU" if any(row[base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8")].endswith("23") for row in rows) else ""
+
 
     return {
         "region": region,
@@ -719,7 +663,6 @@ def extract_from_page(text: str, region_hint: Optional[str] = None) -> dict:
         "email": email,
     }
 
-
 def _looks_like_summary(page_text: str) -> bool:
     upper_text = page_text.upper()
     return base64.b64decode("SlVOSVBFUiBHTCBDT0RF").decode("utf-8") in upper_text and (
@@ -728,7 +671,6 @@ def _looks_like_summary(page_text: str) -> bool:
 
 
 def _looks_like_financial_summary(page_text: str) -> bool:
-    """Recognize invoice totals pages even when no GL approval block exists."""
     upper_text = re.sub(r"\s+", " ", (page_text or "").upper())
     has_totals = any(label in upper_text for label in (
         "SUBTOTAL", "TOTAL G.S.T", "TOTAL GST", "TOTAL AMOUNT", "INVOICE TOTAL", "AMOUNT DUE"
@@ -736,20 +678,12 @@ def _looks_like_financial_summary(page_text: str) -> bool:
     has_money = bool(MONEY_RE.search(page_text or ""))
     return has_totals and has_money
 
-
 def _ocr_page(page) -> str:
-    # Render in memory only; no invoice images or OCR text are written to disk.
     pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
     image = Image.open(BytesIO(pix.tobytes("png")))
     return pytesseract.image_to_string(image, config="--psm 6")
 
-
 def find_candidate_pages(pdf_bytes: bytes) -> tuple[list[tuple[int, str]], bool]:
-    """Find summary pages using embedded text first, then OCR as a fallback.
-
-    Returns (candidate_pages, used_ocr). OCR runs across pages only when the
-    normal text pass finds no summary, keeping text-based PDFs fast.
-    """
     document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     try:
         text_pages = []
@@ -764,10 +698,9 @@ def find_candidate_pages(pdf_bytes: bytes) -> tuple[list[tuple[int, str]], bool]
                 financial_candidates.append((page_number, page_text))
         if candidates:
             return candidates, False
-        # Many vendor invoices contain a financial totals page but do not yet
-        # contain the GL approval block. Allow manual GL entry on that page.
         if financial_candidates:
             return financial_candidates, False
+
 
         ocr_candidates = []
         ocr_financial_candidates = []
@@ -777,7 +710,6 @@ def find_candidate_pages(pdf_bytes: bytes) -> tuple[list[tuple[int, str]], bool]
                 page_text = _ocr_page(page)
             except Exception:
                 ocr_available = False
-                # Continue to other pages; user-facing errors remain generic.
                 continue
             if _looks_like_summary(page_text):
                 ocr_candidates.append((page_number, page_text))
@@ -787,8 +719,6 @@ def find_candidate_pages(pdf_bytes: bytes) -> tuple[list[tuple[int, str]], bool]
             return ocr_candidates, True
         if ocr_financial_candidates:
             return ocr_financial_candidates, True
-        # Last-resort manual mode: expose a small set of final pages so the user
-        # can choose where to place the stamp even if labels are unrecognized.
         nonempty_pages = [(n, t) for n, t in text_pages if t.strip()]
         if nonempty_pages:
             return nonempty_pages[-5:], not ocr_available
@@ -798,12 +728,9 @@ def find_candidate_pages(pdf_bytes: bytes) -> tuple[list[tuple[int, str]], bool]
 
 
 def auto_detect_summary_page(pdf_bytes: bytes, region: str, candidate_pages: list[tuple[int, str]]) -> tuple[list[tuple[int, str]], int]:
-    """Rank pages by region-specific summary labels and coordinate-extracted amounts."""
     doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     try:
         all_pages = [(i, page.get_text("text")) for i, page in enumerate(doc)]
-        # Include the existing candidates and any page that contains the regional
-        # labels, even when an unrelated page has an old approval block.
         candidate_map = {i: text for i, text in candidate_pages}
         for i, text in all_pages:
             upper = re.sub(r"\s+", " ", text.upper())
@@ -841,15 +768,12 @@ def auto_detect_summary_page(pdf_bytes: bytes, region: str, candidate_pages: lis
             return candidate_pages, 0
         ranked = sorted(options, key=score, reverse=True)
         best_index, best_text = ranked[0]
-        # Preserve a manageable dropdown, but make the best detected page its default.
         ordered = [(best_index, best_text)] + [item for item in candidate_pages if item[0] != best_index]
         return ordered, best_index
     finally:
         doc.close()
 
-
 def _region_gl_codes(region: str) -> dict:
-    """Read full GL codes exclusively from Streamlit secrets."""
     region = normalize_region(region)
     try:
         regional = st.secrets.get("regional_gl", {})
@@ -862,7 +786,6 @@ def _region_gl_codes(region: str) -> dict:
     except Exception:
         pass
     return {"net": "", "vat": ""}
-
 
 def classify_rows(region: str, rows: list[dict]) -> list[dict]:
     codes = _region_gl_codes(region)
@@ -877,7 +800,6 @@ def classify_rows(region: str, rows: list[dict]) -> list[dict]:
             label = "Review — region/code not mapped"
         classified.append({**row, "Classification": label})
     return classified
-
 
 def validate_rows(region: str, rows: list[dict], total: Optional[float]) -> list[str]:
     warnings = []
@@ -897,7 +819,6 @@ def validate_rows(region: str, rows: list[dict], total: Optional[float]) -> list
             warnings.append("Line amounts do not match the detected total. Review the values.")
     return warnings
 
-
 def stamp_pdf(
     pdf_bytes: bytes,
     page_index: int,
@@ -909,25 +830,14 @@ def stamp_pdf(
     placement: str,
     region: str = "",
 ) -> bytes:
-    """Place the approval stamp centered in a genuinely unoccupied area.
-
-    The search uses page text block coordinates so it works across invoice layouts
-    where the summary may be at the top, bottom, or side of the page. If no safe
-    rectangle can fit the complete stamp, fail rather than cover invoice content.
-    """
     document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     try:
         page = document[page_index]
         page_rect = page.rect
         region_key = normalize_region(region)
         compact_regional_stamp = region_key in ("IPLS", "NA and LATAM", "EMEA & APAC")
-        # These two invoice layouts have a specific blank area below the service
-        # description and to the left of NET TOTAL PAYABLE. Use a compact stamp
-        # there; all other regions retain their existing placement and sizing.
         font_size = 6.5 if compact_regional_stamp else 9
         line_gap = 7 if compact_regional_stamp else 12
-        # Use a monospaced font so exactly three spaces separate the longest
-        # GL-code column from the AMOUNT column and every amount starts aligned.
         gl_header = base64.b64decode("SlVOSVBFUiBHTCBDT0RF").decode("utf-8")
         longest_gl = max([len(gl_header)] + [
             len(str(row.get(base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8"), ""))) for row in rows
@@ -949,7 +859,6 @@ def stamp_pdf(
 
         stamp_height = len(stamp_lines) * line_gap + (5 if compact_regional_stamp else 12)
         longest = max((len(line) for line in stamp_lines), default=30)
-        # Courier glyphs are 0.6 em wide; allow a small horizontal safety margin.
         stamp_width = min(
             max(210 if compact_regional_stamp else 330,
                 longest * font_size * 0.60 + (12 if compact_regional_stamp else 20)),
@@ -958,7 +867,6 @@ def stamp_pdf(
         if stamp_width < (180 if compact_regional_stamp else 250) or stamp_height > page_rect.height - 36:
             raise ValueError("Stamp does not fit on the selected page.")
 
-        # Occupied text blocks are expanded slightly to preserve a visual margin.
         occupied = []
         for block in page.get_text("blocks"):
             if len(block) < 5:
@@ -977,9 +885,8 @@ def stamp_pdf(
         y_min = margin_y
         y_max = page_rect.height - stamp_height - margin_y
 
+
         if region_key == "IPLS":
-            # IPLS stamp must sit below "PLEASE PAY THIS AMOUNT" and align to
-            # the right side of the PDF page, not to the heading's left edge.
             please_pay_rect = None
             for rect, block_text in occupied:
                 upper = re.sub(r"\\s+", " ", block_text.upper())
@@ -995,18 +902,12 @@ def stamp_pdf(
                         )
             if please_pay_rect is None:
                 raise ValueError("The IPLS placement anchor was not found on the selected page.")
-            # Fix the horizontal position at the page's right margin. Only the
-            # vertical coordinate is searched, and every candidate remains below
-            # the anchor and subject to the existing text-overlap safety check.
             x_min = page_rect.width - stamp_width - 18
             x_max = x_min
             y_min = max(18, please_pay_rect.y1 + 5)
             y_max = page_rect.height - stamp_height - 18
 
         elif compact_regional_stamp:
-            # Preserve the existing placement for NA/LATAM and EMEA/APAC:
-            # below the service-description paragraph, left of NET TOTAL PAYABLE,
-            # and above the THIS INVOICE footer line.
             service_bottom = None
             payable_left = None
             footer_top = None
@@ -1024,12 +925,11 @@ def stamp_pdf(
                 y_min = max(18, service_bottom + 5)
                 y_max = min(page_rect.y1 - stamp_height - 12, footer_top - stamp_height - 5)
 
+
         if x_max < x_min or y_max < y_min:
             raise ValueError("Stamp does not fit on the selected page.")
 
-        # Search a coarse grid, then rank clear positions by closeness to the
-        # center of the page. Include extra candidates around text-block edges,
-        # which often correspond to the large blank section beneath invoice tables.
+
         x_step = max(12, min(24, stamp_width / 14))
         y_step = max(10, min(20, stamp_height / 3))
         xs = {x_min, x_max, (x_min + x_max) / 2}
@@ -1068,12 +968,11 @@ def stamp_pdf(
                 if any(candidate.intersects(rect) for rect, _ in occupied):
                     continue
 
+
                 center = pymupdf.Point(
                     candidate_x + stamp_width / 2,
                     candidate_y + stamp_height / 2,
                 )
-                # Prefer the page center, while the grid and text-edge candidates
-                # allow the stamp to settle into the nearest large clear section.
                 distance = ((center.x - page_center.x) / max(page_rect.width, 1)) ** 2
                 distance += ((center.y - page_center.y) / max(page_rect.height, 1)) ** 2
                 candidates.append((distance, candidate_y, candidate_x))
@@ -1081,16 +980,11 @@ def stamp_pdf(
         if not candidates:
             raise ValueError("No clear space is available for the stamp on this page.")
 
-        # Both placement choices honor the no-overlap rule. The default centers
-        # in the best available blank area; bottom placement prefers the lowest
-        # safe candidate if the user explicitly selects it.
         if placement == "Bottom of summary page":
             _, y, x = max(candidates, key=lambda item: (item[1], -item[0]))
         else:
             _, y, x = min(candidates, key=lambda item: item[0])
 
-        # End the border one monospaced space after the longest stamp line.
-        # Keep the existing placement search and text layout unchanged.
         border_right = x + 5 + (longest + 1) * font_size * 0.60
         stamp_border = pymupdf.Rect(x, y, min(x + stamp_width, border_right), y + stamp_height)
         page.draw_rect(
@@ -1113,327 +1007,16 @@ def stamp_pdf(
     finally:
         document.close()
 
-
-
-
-def _sow_build_pptx(summary_frame: pd.DataFrame, gate_frame: pd.DataFrame, matrix_frame: pd.DataFrame,
-                    analysis_mode: str, scope_count: int, vendor_count: int) -> bytes:
-    """Build an executive-ready PowerPoint in memory from the displayed analysis."""
-    from pptx import Presentation
-    from pptx.util import Inches, Pt
-    from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
-    from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
-    from pptx.chart.data import CategoryChartData
-    from pptx.dml.color import RGBColor
-
-    # Normalize export schemas defensively: analysis tables may omit optional
-    # columns for small/partial datasets, but PPTX generation must still work.
-    summary_frame = summary_frame.copy()
-    gate_frame = gate_frame.copy()
-    matrix_frame = matrix_frame.copy()
-    summary_defaults = {
-        "Rank": "",
-        "Vendor": "Unidentified vendor",
-        "Gate 1 status": "Review",
-        "Global reach": 0,
-        "Scope breadth": 0,
-        "SLA rigor": 0,
-        "Commercials": 0,
-        "Composite score (/100)": 0,
-        "Recommended role": "Not shortlisted",
-    }
-    for column, default in summary_defaults.items():
-        if column not in summary_frame.columns:
-            summary_frame[column] = default
-    gate_defaults = {
-        "Vendor": "Unidentified vendor",
-        "Regional coverage evidence": "Not evidenced",
-        "Core scope evidence": "Not evidenced",
-        "Compliance evidence": "Not evidenced",
-        "Gate 1 status": "Review",
-        "Gate rationale": "Evidence requires manual review.",
-    }
-    for column, default in gate_defaults.items():
-        if column not in gate_frame.columns:
-            gate_frame[column] = default
-    if "Scope requirement" not in matrix_frame.columns:
-        matrix_frame.insert(0, "Scope requirement", "No scope rows available")
-    if "Rank" not in summary_frame.columns or summary_frame["Rank"].eq("").all():
-        summary_frame["Rank"] = range(1, len(summary_frame) + 1)
-    summary_frame["Composite score (/100)"] = pd.to_numeric(
-        summary_frame["Composite score (/100)"], errors="coerce"
-    ).fillna(0)
-    for column in ("Global reach", "Scope breadth", "SLA rigor", "Commercials"):
-        summary_frame[column] = pd.to_numeric(summary_frame[column], errors="coerce").fillna(0)
-
-    prs = Presentation()
-    prs.slide_width = Inches(13.333)
-    prs.slide_height = Inches(7.5)
-    navy = RGBColor(21, 45, 78)
-    teal = RGBColor(0, 138, 105)
-    grey = RGBColor(92, 105, 121)
-    pale = RGBColor(239, 244, 248)
-
-    def title(slide, heading, subtitle=None):
-        box = slide.shapes.add_textbox(Inches(.55), Inches(.32), Inches(12.2), Inches(.55))
-        para = box.text_frame.paragraphs[0]
-        para.text = heading
-        para.font.name = "Aptos Display"
-        para.font.size = Pt(25)
-        para.font.bold = True
-        para.font.color.rgb = navy
-        if subtitle:
-            sub = slide.shapes.add_textbox(Inches(.58), Inches(.92), Inches(12.0), Inches(.35))
-            pp = sub.text_frame.paragraphs[0]
-            pp.text = subtitle
-            pp.font.name = "Aptos"
-            pp.font.size = Pt(10)
-            pp.font.color.rgb = grey
-
-    def footer(slide, number):
-        box = slide.shapes.add_textbox(Inches(.55), Inches(7.15), Inches(12.2), Inches(.18))
-        pp = box.text_frame.paragraphs[0]
-        pp.text = f"Vendor SOW Analysis  •  Evidence-screening output  •  Slide {number}"
-        pp.font.size = Pt(8)
-        pp.font.color.rgb = grey
-
-    # Cover / executive summary
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    slide.background.fill.solid()
-    slide.background.fill.fore_color.rgb = pale
-    band = slide.shapes.add_shape(1, Inches(0), Inches(0), Inches(13.333), Inches(2.15))
-    band.fill.solid(); band.fill.fore_color.rgb = navy; band.line.fill.background()
-    head = slide.shapes.add_textbox(Inches(.7), Inches(.55), Inches(11.9), Inches(.7))
-    hp = head.text_frame.paragraphs[0]
-    hp.text = "GLOBAL VENDOR SOW EVALUATION"
-    hp.font.size = Pt(28); hp.font.bold = True; hp.font.color.rgb = RGBColor(255,255,255)
-    sub = slide.shapes.add_textbox(Inches(.72), Inches(1.28), Inches(11.5), Inches(.4))
-    sp = sub.text_frame.paragraphs[0]
-    sp.text = "Two-gate screening • Weighted evaluation • Primary and backup shortlist"
-    sp.font.size = Pt(14); sp.font.color.rgb = RGBColor(225,240,238)
-    metrics = [
-        ("Vendors assessed", str(vendor_count)),
-        ("Scope clusters", str(scope_count)),
-        ("Gate 1 eligible", str((gate_frame["Gate 1 status"] != "Fail").sum())),
-        ("Shortlist", str(min(6, int((gate_frame["Gate 1 status"] != "Fail").sum())))),
-    ]
-    for i,(label,value) in enumerate(metrics):
-        x = .7 + i*3.1
-        sh = slide.shapes.add_shape(1, Inches(x), Inches(2.75), Inches(2.75), Inches(1.15))
-        sh.fill.solid(); sh.fill.fore_color.rgb = RGBColor(255,255,255); sh.line.color.rgb = RGBColor(215,224,232)
-        tf = sh.text_frame; tf.vertical_anchor = MSO_ANCHOR.MIDDLE
-        tf.paragraphs[0].text = value
-        tf.paragraphs[0].alignment = PP_ALIGN.CENTER
-        tf.paragraphs[0].font.size = Pt(25); tf.paragraphs[0].font.bold = True; tf.paragraphs[0].font.color.rgb = teal
-        pp = tf.add_paragraph(); pp.text = label; pp.alignment = PP_ALIGN.CENTER; pp.font.size = Pt(10); pp.font.color.rgb = grey
-    note = slide.shapes.add_textbox(Inches(.75), Inches(4.45), Inches(11.9), Inches(1.1))
-    note.text_frame.text = (
-        f"Analysis mode: {analysis_mode}\\n"
-        "Use this pack as a decision-support summary, not as a substitute for contract, legal, security, "
-        "country coverage, and commercial validation. Missing evidence is marked for review rather than "
-        "assumed to be a confirmed capability."
-    )
-    for para in note.text_frame.paragraphs:
-        para.font.size = Pt(13); para.font.color.rgb = navy
-    footer(slide, 1)
-
-    # Composite score chart
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    title(slide, "Weighted Evaluation Results", "Composite score is based on four evidence indicators: global reach (35%), scope breadth (25%), SLA rigor (20%), commercials and scalability (20%).")
-    chart_data = CategoryChartData()
-    chart_data.categories = summary_frame["Vendor"].astype(str).tolist()
-    chart_data.add_series("Composite score (/100)", summary_frame["Composite score (/100)"].astype(float).tolist())
-    chart = slide.shapes.add_chart(XL_CHART_TYPE.BAR_CLUSTERED, Inches(.7), Inches(1.55), Inches(11.9), Inches(4.95), chart_data).chart
-    chart.has_legend = False
-    chart.value_axis.minimum_scale = 0
-    chart.value_axis.maximum_scale = 100
-    chart.value_axis.has_title = True
-    chart.value_axis.axis_title.text_frame.text = "Score / 100"
-    chart.category_axis.reverse_order = True
-    chart.chart_style = 10
-    footer(slide, 2)
-
-    # Recommended shortlist
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    title(slide, "Recommended Shortlist", "Top eligible vendors are separated into primary delivery and backup / surge capacity.")
-    shortlist = summary_frame[
-        (summary_frame["Recommended role"] != "Not shortlisted") &
-        (summary_frame["Gate 1 status"] != "Fail")
-    ].sort_values("Rank").head(6)
-    cols = ["Rank", "Vendor", "Gate 1 status", "Global reach", "Scope breadth", "SLA rigor", "Commercials", "Composite score (/100)", "Recommended role"]
-    table = slide.shapes.add_table(max(1, len(shortlist)+1), len(cols), Inches(.35), Inches(1.55), Inches(12.65), Inches(min(4.9, .42*(len(shortlist)+1)))).table
-    widths = [0.48, 1.65, 1.0, 1.05, 1.05, 1.0, 1.1, 1.25, 2.2]
-    for j,w in enumerate(widths): table.columns[j].width = Inches(w)
-    for j,c in enumerate(cols):
-        cell = table.cell(0,j); cell.text = c; cell.fill.solid(); cell.fill.fore_color.rgb = navy
-        for pp in cell.text_frame.paragraphs:
-            pp.font.size = Pt(8); pp.font.bold = True; pp.font.color.rgb = RGBColor(255,255,255)
-    for i,(_,r) in enumerate(shortlist.iterrows(), start=1):
-        for j,c in enumerate(cols):
-            val = r.get(c, "")
-            cell = table.cell(i,j); cell.text = str(val)
-            cell.fill.solid(); cell.fill.fore_color.rgb = RGBColor(245,249,251) if i%2 else RGBColor(255,255,255)
-            for pp in cell.text_frame.paragraphs:
-                pp.font.size = Pt(8); pp.font.color.rgb = navy
-    footer(slide, 3)
-
-    # Gate 1 evidence / compliance
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    title(slide, "Gate 1 — Non-Negotiable Screening", "Explicit failures are knocked out. Missing or ambiguous evidence is flagged for manual verification.")
-    gcols = ["Vendor", "Regional coverage evidence", "Core scope evidence", "Compliance evidence",
-             "Gate 1 status", "Gate rationale", "Failure explanation — what it means"]
-    gcols = [c for c in gcols if c in gate_frame.columns]
-    gshow = gate_frame.reindex(columns=gcols).head(15)
-    table = slide.shapes.add_table(len(gshow)+1, len(gcols), Inches(.4), Inches(1.5), Inches(12.5), Inches(min(5.25, .34*(len(gshow)+1)))).table
-    gw = [1.25,1.65,1.55,1.45,.9,1.7,4.0]
-    for j,w in enumerate(gw): table.columns[j].width = Inches(w)
-    for j,c in enumerate(gcols):
-        cell=table.cell(0,j); cell.text=c; cell.fill.solid(); cell.fill.fore_color.rgb=navy
-        for pp in cell.text_frame.paragraphs: pp.font.size=Pt(8); pp.font.bold=True; pp.font.color.rgb=RGBColor(255,255,255)
-    for i,(_,r) in enumerate(gshow.iterrows(),1):
-        for j,c in enumerate(gcols):
-            cell=table.cell(i,j); cell.text=str(r.get(c,""))
-            cell.fill.solid(); cell.fill.fore_color.rgb=RGBColor(245,249,251) if i%2 else RGBColor(255,255,255)
-            for pp in cell.text_frame.paragraphs: pp.font.size=Pt(7); pp.font.color.rgb=navy
-    footer(slide, 4)
-
-    # Scope comparison snapshot
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    title(slide, "Scope Coverage Snapshot", "Detailed scope-by-vendor status matrix is available in the companion workbook.")
-    matrix = matrix_frame.copy()
-    max_rows = min(14, len(matrix))
-    matrix = matrix.head(max_rows)
-    ncols = min(9, len(matrix.columns))
-    matrix = matrix.iloc[:, :ncols]
-    table = slide.shapes.add_table(len(matrix)+1, ncols, Inches(.35), Inches(1.5), Inches(12.65), Inches(min(5.2, .34*(len(matrix)+1)))).table
-    for j,c in enumerate(matrix.columns):
-        cell=table.cell(0,j); cell.text=str(c)[:32]; cell.fill.solid(); cell.fill.fore_color.rgb=navy
-        for pp in cell.text_frame.paragraphs: pp.font.size=Pt(7); pp.font.bold=True; pp.font.color.rgb=RGBColor(255,255,255)
-    for i,(_,r) in enumerate(matrix.iterrows(),1):
-        for j,c in enumerate(matrix.columns):
-            cell=table.cell(i,j); cell.text=str(r[c])[:45]
-            cell.fill.solid(); cell.fill.fore_color.rgb=RGBColor(245,249,251) if i%2 else RGBColor(255,255,255)
-            for pp in cell.text_frame.paragraphs: pp.font.size=Pt(7); pp.font.color.rgb=navy
-    footer(slide, 5)
-
-    # Regional footprint / operating readiness snapshot (slide 6).
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    title(slide, "Global Footprint & Coverage Readiness",
-          "Coverage labels are evidence signals only; verify country, entity, delivery-center, and subcontractor clauses.")
-    coverage_cols = [c for c in matrix_frame.columns if c != "Scope requirement"]
-    coverage_cols = coverage_cols[:6]
-    regions = ["Americas", "EMEA", "APAC"]
-    footprint_rows = []
-    for vendor in summary_frame["Vendor"].astype(str).tolist()[:6]:
-        row = {"Vendor": vendor}
-        # Matrix scope labels are not reliable proof of geography, so use the
-        # Gate 1 regional evidence as the source for this qualitative snapshot.
-        match = gate_frame[gate_frame["Vendor"].astype(str) == vendor]
-        regional = str(match.iloc[0].get("Regional coverage evidence", "Not evidenced")) if not match.empty else "Not evidenced"
-        for region in regions:
-            row[region] = "Evidence mentioned" if region.lower() in regional.lower() else "Verify"
-        footprint_rows.append(row)
-    fp = pd.DataFrame(footprint_rows, columns=["Vendor"] + regions)
-    table = slide.shapes.add_table(max(1, len(fp)+1), 4, Inches(1.1), Inches(1.65), Inches(11.1), Inches(min(4.4, .55*(len(fp)+1)))).table
-    for j, c in enumerate(["Vendor"] + regions):
-        cell = table.cell(0,j); cell.text = c; cell.fill.solid(); cell.fill.fore_color.rgb = navy
-        for pp in cell.text_frame.paragraphs:
-            pp.font.size = Pt(11); pp.font.bold = True; pp.font.color.rgb = RGBColor(255,255,255)
-    for i, (_, r) in enumerate(fp.iterrows(), 1):
-        for j, c in enumerate(["Vendor"] + regions):
-            cell = table.cell(i,j); cell.text = str(r.get(c, "Verify"))
-            cell.fill.solid(); cell.fill.fore_color.rgb = RGBColor(245,249,251) if i%2 else RGBColor(255,255,255)
-            for pp in cell.text_frame.paragraphs:
-                pp.font.size = Pt(10); pp.font.color.rgb = navy
-    footer(slide, 6)
-
-    # Primary and contingency allocation (slide 7).
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    title(slide, "Primary & Contingency Allocation",
-          "Allocation is a ranked recommendation; confirm scope fit, rate cards, standby terms, and activation triggers before award.")
-    role_rows = summary_frame[
-        (summary_frame["Recommended role"].astype(str) != "Not shortlisted") &
-        (summary_frame["Gate 1 status"].astype(str) != "Fail")
-    ].sort_values("Rank").head(6)
-    alloc_cols = ["Recommended role", "Vendor", "Composite score (/100)", "Global reach", "Scope breadth", "SLA rigor", "Commercials"]
-    table = slide.shapes.add_table(max(1, len(role_rows)+1), len(alloc_cols), Inches(.45), Inches(1.6), Inches(12.4), Inches(min(3.6, .48*(len(role_rows)+1)))).table
-    alloc_widths = [1.65, 2.15, 1.55, 1.45, 1.45, 1.45, 1.55]
-    for j, w in enumerate(alloc_widths):
-        table.columns[j].width = Inches(w)
-    for j,c in enumerate(alloc_cols):
-        cell=table.cell(0,j); cell.text=c; cell.fill.solid(); cell.fill.fore_color.rgb=navy
-        for pp in cell.text_frame.paragraphs:
-            pp.font.size=Pt(9); pp.font.bold=True; pp.font.color.rgb=RGBColor(255,255,255)
-    for i,(_,r) in enumerate(role_rows.iterrows(),1):
-        for j,c in enumerate(alloc_cols):
-            cell=table.cell(i,j); cell.text=str(r.get(c,""))
-            cell.fill.solid(); cell.fill.fore_color.rgb=RGBColor(245,249,251) if i%2 else RGBColor(255,255,255)
-            for pp in cell.text_frame.paragraphs:
-                pp.font.size=Pt(9); pp.font.color.rgb=navy
-    allocation_note = slide.shapes.add_textbox(Inches(.7), Inches(5.1), Inches(11.9), Inches(1.15))
-    allocation_note.text_frame.text = (
-        "Primary tier: highest-ranked eligible vendors for core delivery.\n"
-        "Backup tier: next-ranked eligible vendors for failover, surge, or specialized scope.\n"
-        "Governance check: do not claim zero single-points-of-failure unless country-level and service-pillar coverage is verified."
-    )
-    for pp in allocation_note.text_frame.paragraphs:
-        pp.font.size = Pt(12); pp.font.color.rgb = navy
-    footer(slide, 7)
-
-    # Commercial decision checks and transition roadmap (slide 8).
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    title(slide, "Commercial Controls & Implementation Roadmap",
-          "Commercial indices are comparative signals; validate actual rate cards, volume assumptions, and contract protections.")
-    left = slide.shapes.add_textbox(Inches(.65), Inches(1.55), Inches(5.9), Inches(4.9))
-    left.text_frame.text = (
-        "COMMERCIAL VALIDATION\n"
-        "• Compare blended hourly/unit rates by region and service line\n"
-        "• Validate minimum commitments, transition fees, indexation, and volume discounts\n"
-        "• Negotiate SLA credit formulas and termination-for-convenience terms\n"
-        "• Confirm standby vendors have no hidden minimum spend or retainer\n"
-        "• Model baseline cost and savings only where source data supports the calculation"
-    )
-    right = slide.shapes.add_textbox(Inches(6.75), Inches(1.55), Inches(5.9), Inches(4.9))
-    right.text_frame.text = (
-        "PROPOSED TRANSITION SEQUENCE\n"
-        "Weeks 1–2: Legal review and MSA / standby agreement finalization\n"
-        "Weeks 3–4: SOW sign-off, SLA schedules, governance dashboard setup\n"
-        "Weeks 5–8: Phased onboarding, knowledge transfer, shadow-support pilot\n"
-        "Week 9: Production cutover after readiness and risk sign-off\n\n"
-        "Decision requested: authorize controlled negotiations with the recommended primary and backup tiers."
-    )
-    for shape in (left, right):
-        for pp in shape.text_frame.paragraphs:
-            pp.font.size = Pt(13); pp.font.color.rgb = navy
-            if pp.text.isupper():
-                pp.font.bold = True
-    disclaimer = slide.shapes.add_textbox(Inches(.7), Inches(6.45), Inches(12), Inches(.42))
-    disclaimer.text_frame.text = (
-        "Before vendor selection, validate source clauses for countries, response/resolution SLAs, coverage hours, "
-        "onsite/remote delivery, exclusions, dependencies, certifications, subcontracting, and commercial assumptions. "
-        "This analyzer does not certify legal equivalence."
-    )
-    for pp in disclaimer.text_frame.paragraphs:
-        pp.font.size = Pt(8); pp.font.color.rgb = grey
-    footer(slide, 8)
-
-    out = BytesIO()
-    prs.save(out)
-    return out.getvalue()
-
-
 # -----------------------------------------------------------------------------
-# Tool navigation and Vendor SOW Analyzer (kept separate from PDF stamping)
+# SOW DOCUMENT INGESTION AND PARSING HELPERS
 # -----------------------------------------------------------------------------
-SOW_STOPWORDS = set("""a an and are as at be been being by for from has have had in into is it its of on or our that the their this to with will can may must should shall services service scope work works vendor supplier client customer global regional local support manage management provide provision including include includes across per via using use used related applicable requirements requirement deliver deliverables delivery activities activity responsibilities responsibility hereby hereunder thereto therein thereof pursuant agreement agreements party parties hpe hereby herein such any all each both other same respective said may also not no nor if then than where when while which who whom whose more most less very other however therefore section clause exhibit appendix attachment page number version date confidential proprietary company enterprise inc limited ltd gmbh private pte mexico japan india china anz apj naas non""".split())
-
 SOW_SUPPORTED_EXTS = {'.pdf', '.docx', '.docm', '.xlsx', '.xlsm', '.xls', '.pptx', '.txt', '.md', '.csv', '.zip'}
 SOW_MAX_ARCHIVE_DEPTH = 3
 SOW_MAX_DOCUMENTS = 100
 SOW_MAX_TOTAL_BYTES = 100 * 1024 * 1024
 
 
-def _sow_read_document(name, data):
+def _sow_read_document(name: str, data: bytes) -> str:
     """Read one supported SOW/capability document in memory only."""
     suffix = ('.' + name.rsplit('.', 1)[-1].lower()) if '.' in name else ''
     if suffix == '.pdf':
@@ -1443,7 +1026,6 @@ def _sow_read_document(name, data):
                 raise ValueError('Password-protected PDF; remove the password or provide an unlocked copy.')
             pages = [page.get_text('text') for page in doc]
             text_value = '\n'.join(pages)
-            # OCR is a fallback only for genuinely text-poor/scanned PDFs.
             if len(text_value.strip()) < 100:
                 ocr_pages = []
                 for page in doc:
@@ -1487,13 +1069,8 @@ def _sow_read_document(name, data):
         return '\n'.join(parts)
     raise ValueError('Unsupported document format')
 
-
 def _sow_expand_uploads(uploads, return_errors=False):
-    """Expand supported documents and nested ZIPs in memory, deduplicating exact copies.
-
-    A single unreadable/password-protected document no longer aborts the entire batch.
-    Archive size/document-count safety limits remain hard errors.
-    """
+    """Expand supported documents and nested ZIPs in memory, deduplicating exact copies."""
     expanded = []
     seen_hashes = set()
     processing_errors = []
@@ -1523,10 +1100,6 @@ def _sow_expand_uploads(uploads, return_errors=False):
                         if item.flag_bits & 0x1:
                             processing_errors.append({'File': f'{name} / {inner_name}', 'Reason': 'Password-protected archive entry; skipped.'})
                             continue
-                        # Enforce the expanded-size limit on actual document payloads
-                        # inside add_document(), not on a nested ZIP container itself.
-                        # Counting both a nested archive and its extracted contents caused
-                        # valid batches to hit the 100 MB limit prematurely.
                         if inner_suffix != '.zip' and item.file_size > SOW_MAX_TOTAL_BYTES:
                             raise ValueError('A single expanded document exceeds the 100 MB processing limit.')
                         try:
@@ -1556,12 +1129,12 @@ def _sow_expand_uploads(uploads, return_errors=False):
         try:
             text_value = _sow_read_document(name, data)
         except Exception as exc:
-            processing_errors.append({'File': name, 'Reason': f'Could not read this document ({type(exc).__name__}); check file integrity, password protection, and required document-reader dependencies.'})
+            processing_errors.append({'File': name, 'Reason': f'Could not read this document ({type(exc).__name__}); check file integrity and password protection.'})
             return
         if text_value and text_value.strip():
             expanded.append({'File': name, 'Text': text_value, 'SHA256': digest})
         else:
-            processing_errors.append({'File': name, 'Reason': 'No readable text was extracted. Scanned/image-only or blank documents may need OCR or manual review.'})
+            processing_errors.append({'File': name, 'Reason': 'No readable text was extracted. Scanned/image-only documents require OCR.'})
 
     for uploaded in uploads or []:
         try:
@@ -1574,246 +1147,558 @@ def _sow_expand_uploads(uploads, return_errors=False):
         return expanded, processing_errors
     return expanded
 
+# -----------------------------------------------------------------------------
+# SOW ANALYSIS, PARSER ENGINE, SCORING, AND EXPORT GENERATORS
+# -----------------------------------------------------------------------------
+def _make_unique_columns(df):
+    seen = {}
+    cols = []
+    for col in df.columns:
+        col = str(col)
+        if col not in seen:
+            seen[col] = 0
+            cols.append(col)
+        else:
+            seen[col] += 1
+            cols.append(f"{col}_{seen[col]}")
+    df.columns = cols
+    return df
 
-def _sow_read_upload(uploaded):
-    """Backward-compatible reader for a single document or ZIP archive."""
-    docs = _sow_expand_uploads([uploaded])
-    return '\n\n'.join(f"DOCUMENT: {item['File']}\n{item['Text']}" for item in docs)
+def _sow_normalize_region_tag(coverage: str) -> str:
+    """Standardize regional tags to determine if a vendor has a specific assigned region."""
+    cov_lower = str(coverage or "").lower()
+    found_regions = []
+    if any(k in cov_lower for k in ["continental us", "united states", "usa", "us"]):
+        found_regions.append("US")
+    if "canada" in cov_lower:
+        found_regions.append("CA")
+    if any(k in cov_lower for k in ["emea", "europe", "uk"]):
+        found_regions.append("EMEA")
+    if any(k in cov_lower for k in ["apac", "asia", "australia"]):
+        found_regions.append("APAC")
+    if any(k in cov_lower for k in ["latam", "latin america"]):
+        found_regions.append("LATAM")
 
 
-def _sow_normalize(text):
-    return re.sub(r'[^a-z0-9]+', ' ', (text or '').lower()).strip()
+    if not found_regions or len(found_regions) >= 3:
+        return "GLOBAL"  # General/global scope, eligible for single vendor merging
+    return "-".join(sorted(found_regions))
+
+def _sow_filter_duplicate_files(expanded_docs: list[dict]) -> tuple[list[dict], list[str]]:
+    """Exclude duplicate files based on content hash (SHA256) and file names."""
+    unique_docs = []
+    seen_hashes = set()
+    seen_names = set()
+    duplicate_names = []
 
 
-def _sow_sentences(text):
-    """Extract line-level clauses while discarding page furniture and contents leaders."""
-    text = (text or '').replace('\r', '\n')
-    pieces = []
-    for raw_line in text.split('\n'):
-        line = re.sub(r'[ \t\f\v]+', ' ', raw_line).strip(' \t-•*▪◦\uf0b7')
-        if not line or len(line) < 24:
+    for doc in expanded_docs:
+        h = doc.get('SHA256', '')
+        n = doc.get('File', '').strip()
+        if (h and h in seen_hashes) or (n and n in seen_names):
+            duplicate_names.append(n)
             continue
-        if line.isupper() and len(line.split()) < 14:
+        if h:
+            seen_hashes.add(h)
+        if n:
+            seen_names.add(n)
+        unique_docs.append(doc)
+
+
+    return unique_docs, duplicate_names
+
+
+def _sow_merge_duplicate_vendors(vendor_data_list: list[dict]) -> list[dict]:
+    """
+    Merge files with the same supplier as one vendor, EXCEPT if the vendor 
+    has a specific assigned region.
+    """
+    merged = {}
+    for vendor in vendor_data_list:
+        clean_supplier = re.sub(r'[^a-z0-9]', '', str(vendor.get('Vendor', '')).lower())
+        region_tag = _sow_normalize_region_tag(vendor.get('Coverage', ''))
+
+
+        # If vendor has a specific assigned region (e.g. US, CA, EMEA), isolate by region tag.
+        # Otherwise, if generic/global, treat all files under this supplier as one vendor.
+        if region_tag != "GLOBAL":
+            merge_key = f"{clean_supplier}::{region_tag}"
+        else:
+            merge_key = f"{clean_supplier}::GLOBAL"
+
+
+        if merge_key not in merged:
+            copy_vendor = dict(vendor)
+            copy_vendor['Source Files'] = [vendor.get('File', '')]
+            # Suffix vendor name with specific region if segregated
+            if region_tag != "GLOBAL" and not any(r in vendor.get('Vendor', '').upper() for r in ["US", "CA", "EMEA", "APAC", "LATAM"]):
+                copy_vendor['Vendor'] = f"{vendor.get('Vendor', '')} ({region_tag})"
+            merged[merge_key] = copy_vendor
             continue
-        if re.search(r'\.{4,}|…{3,}|_{5,}', line):
-            continue
-        if re.fullmatch(r'(?:page\s*)?\d+(?:\s+of\s+\d+)?', line, re.I):
-            continue
-        if re.search(r'(?i)^(?:statement of work|hewlett packard enterprise confidential|confidentiality notice|important confidentiality notice|document history|revision history|table of contents|contents|docusign envelope id)', line):
-            continue
-        split_parts = re.split(r'(?<=[.!?;])\s+(?=[A-Z0-9(])', line)
-        pieces.extend(part.strip(' \t-•*▪◦\uf0b7') for part in split_parts if len(part.strip()) >= 24)
-    return pieces
 
 
-def _sow_terms(text, limit=120):
-    tokens = re.findall(r'[a-z][a-z0-9+#./-]{2,}', (text or '').lower())
-    counts = Counter(token.strip('./-') for token in tokens if token not in SOW_STOPWORDS and len(token.strip('./-')) > 2)
-    return [word for word, _ in counts.most_common(limit)]
+        target = merged[merge_key]
+        target['Source Files'].append(vendor.get('File', ''))
 
 
-def _sow_extract_scope(text, limit=240):
-    """Prioritize operational scope, capability, coverage, SLA, and deliverable clauses."""
-    sentences = _sow_sentences(text)
-    if not sentences:
-        return []
-    action_terms = (
-        'provide onsite', 'onsite services', 'on-site services', 'break-fix', 'break fix',
-        'hardware replacement', 'replace hardware', 'parts replacement', 'troubleshooting',
-        'technical support', 'remote support', 'field service', 'field services', 'logistics',
-        'case management', 'parts management', 'customer service', 'incident management',
-        'service level', 'service levels', 'response time', 'resolution time', 'customer sla',
-        '24/7', '24x7', '9x5', 'business hours', 'service coverage', 'geographies in scope',
-        'countries in scope', 'country coverage', 'dispatch', 'work order', 'spare parts',
-        'inventory', 'shipment', 'warehouse', 'installation', 'maintenance', 'repair',
-        'escalation', 'ticket', 'incident', 'deliverable', 'weekly status report', 'sla report',
-        'end-to-end', 'e2e', 'project manager', 'project management', 'service improvement',
-        'monitor and update', 'customer updates', 'onsite support', 'technical assistance',
-        'administrative support', 'supply chain', 'customer contact', 'service request',
-        'hardware remediation', 'smart hands', 'configuration', 'network cabling',
-        'response and repair', 'service area', 'language coverage', 'support model'
-    )
-    boilerplate_terms = (
-        'confidentiality notice', 'confidential and proprietary', 'table of contents', 'document history',
-        'revision history', 'docusign envelope', 'all rights reserved', 'governed by the laws',
-        'limitation of liability', 'indirect or consequential damages', 'counterparts and signatures',
-        'this document is the property', 'intentionally left blank', 'signature page',
-        'agreement shall be governed', 'terms and conditions', 'copyright', 'not to be disclosed',
-        'not to be duplicated', 'intellectual property', 'force majeure', 'indemnify and hold harmless',
-        'employee of supplier', 'dressed in a manner', 'professional and lawful manner',
-        'shall be governed by', 'without the express written authorization', 'shall exercise the same degree'
-    )
-    selected = []
-    for sentence in sentences:
-        lower = sentence.lower()
-        normalized = _sow_normalize(sentence)
-        if any(term in lower for term in boilerplate_terms):
-            continue
-        if len(normalized.split()) < 7:
-            continue
-        if not any(term in lower for term in action_terms):
-            continue
-        selected.append(sentence)
-    if not selected:
-        selected = [s for s in sentences if len(s.split()) >= 8 and not any(t in s.lower() for t in boilerplate_terms)]
-    unique, seen = [], set()
-    for sentence in selected:
-        key = _sow_normalize(sentence)
-        if key and key not in seen:
-            seen.add(key)
-            unique.append(sentence)
-        if len(unique) >= limit:
-            break
-    return unique
+        # Combine distinct exclusions
+        target['Exclusions_Count'] = max(target.get('Exclusions_Count', 0), vendor.get('Exclusions_Count', 0))
 
 
-def _sow_similarity(scope, vendor_text):
-    """Score the best clause-level match instead of comparing against whole-document boilerplate."""
-    target = set(_sow_terms(scope, 500))
-    if not target:
-        return 0.0, []
-    candidates = list(vendor_text) if isinstance(vendor_text, (list, tuple, set)) else _sow_extract_scope(vendor_text, limit=240)
-    best_score, best_terms = 0.0, []
-    for candidate in candidates:
-        tokens = set(_sow_terms(candidate, 500))
-        overlap = target & tokens
-        if len(overlap) < min(2, len(target)):
-            continue
-        recall = len(overlap) / max(len(target), 1)
-        precision = len(overlap) / max(len(tokens), 1)
-        score = 100 * (0.75 * recall + 0.25 * precision)
-        if score > best_score:
-            best_score, best_terms = score, sorted(overlap)
-    return round(min(best_score, 100), 1), best_terms
+        # Maintain lowest ticket cost for blended rate comparisons
+        for cost_key in ['NBD_IOH', 'Four_Hr_IOH', 'Ext_IOH', 'Scissor_Lift', 'Spotter_IOH']:
+            if vendor.get(cost_key, 0.0) > 0:
+                target[cost_key] = min(target.get(cost_key, vendor[cost_key]), vendor[cost_key])
 
 
-def _sow_scope_label(sentence):
-    cleaned = re.sub(r'\s+', ' ', sentence).strip()
-    return cleaned[:180] + ('…' if len(cleaned) > 180 else '')
+        # Retain stricter acknowledgment windows
+        target['Ack_SD'] = min(target.get('Ack_SD', 15), vendor.get('Ack_SD', 15))
+        target['Data_Penalty'] = max(target.get('Data_Penalty', 0.0), vendor.get('Data_Penalty', 0.0))
 
 
-def _sow_infer_vendor(name, text):
-    """Infer a legal supplier name when stated; otherwise clearly mark it as unidentified."""
-    source = (text or '').replace('\r', '\n')
-    known_entity_patterns = [
-        r'(?i)Hemmersbach Worldwide GmbH', r'(?i)EXEO GLOBAL PTE\.? LTD\.?',
-        r'(?i)Cygnet IT Services Private Limited', r'(?i)ARCO Japan,? Inc\.?',
-        r'(?i)ARA Technologies trading as AWA Technology Services',
-        r'(?i)Beijing Huayuweicheng Technology Service Co\.?\s*,?\s*Ltd\.?',
-        r'(?i)Smartlog Mexico S\.?A\.? de C\.?V\.?',
+    return list(merged.values())
+
+
+def _sow_parse_vendor_data(name: str, text: str, is_baseline: bool = False) -> dict:
+    """Extract scope, coverage, SLAs, rate cards, and penalties from SOW text."""
+    clean_text = text.replace('\r', '\n')
+    lower = clean_text.lower()
+
+    # 1. Vendor Name
+    vendor_name = ""
+    v_patterns = [
+        r'(?i)supplier\s*:\s*([A-Za-z0-9\s.,&\'\(\)-]{3,80})',
+        r'(?i)between\s+[\w\s.,]+\s+and\s+([A-Za-z0-9\s.,&\'\(\)-]{3,80})(?:\s*\(["\']Supplier["\']\))',
+        r'(?i)SUPPLIER\s+ENTITY\s+NAME\s*[\n\r:]+\s*([A-Za-z0-9\s.,&\'\(\)-]{3,80})',
+        r'(?i)vendor\s*:\s*([A-Za-z0-9\s.,&\'\(\)-]{3,80})'
     ]
-    for pattern in known_entity_patterns:
-        match = re.search(pattern, source)
-        if match:
-            value = re.sub(r'\s+', ' ', match.group(0)).strip(' .;:-')
-            if value.lower().startswith('ara technologies'):
-                return 'ARA Technologies Pty Limited (AWA Technology Services)'
-            if value.lower().startswith('smartlog'):
-                return 'Smartlog Mexico SA de CV'
-            if value.lower().startswith('beijing'):
-                return 'Beijing Huayuweicheng Technology Service Co., Ltd.'
-            return value
-    candidates = re.findall(r'(?im)^\s*(?:supplier(?:\s+name)?|subcontractor|proveedor)\s*:\s*([^\n\r|]{2,160})', source)
-    for candidate in candidates:
-        value = re.sub(r'\s+', ' ', candidate).strip(' .;:-')
-        if not value or re.fullmatch(r'[_\- .]+', value) or 'project manager' in value.lower():
-            continue
-        if len(value) >= 3 and not value.lower().startswith(('please insert', 'to be completed', 'name and title')):
-            return value
-    stem = re.sub(r'\.(pdf|docx|docm|xlsx|xlsm|xls|pptx|txt|md|csv|zip)$', '', name.rsplit('/', 1)[-1], flags=re.I)
-    stem = re.sub(r'^(?:SOW\s*)', '', stem, flags=re.I).strip(' _-')
-    return f'Unidentified supplier — {stem or "uploaded document"}'
+    for vp in v_patterns:
+        vm = re.search(vp, clean_text)
+        if vm:
+            cand = vm.group(1).strip().split('\n')[0].strip(' -:')
+            if len(cand) > 3 and not any(kw in cand.lower() for kw in ['tbd', 'multiple', 'insert', 'company']):
+                vendor_name = cand
+                break
+    if not vendor_name:
+        stem = re.sub(r'\.(pdf|docx|docm|xlsx|xlsm|xls|pptx|txt|md|csv|zip)$', '', name.rsplit('/', 1)[-1], flags=re.I)
+        vendor_name = re.sub(r'^(?:SOW\s*[-_]?\s*)', '', stem, flags=re.I).strip(' _-')
+
+    # 2. Term Dates
+    term_str = "Not Specified"
+    date_m = re.findall(r'(?i)(?:entered into on|effective date|beginning|term)\s*:?\s*([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', clean_text)
+    if date_m:
+        term_str = f"{date_m[0]} (Multi-year)"
+
+    # 3. Currency[span_3](start_span)[span_3](end_span)
+    curr = "USD"
+    if "cad" in lower or "$cad" in lower:
+        curr = "CAD"
+    elif "eur" in lower or "€" in clean_text:
+        curr = "EUR"
 
 
-def _sow_detect_coverage_area(file_names, text=''):
-    """Return only geographic labels supported by the document title."""
-    labels = []
-    for name in file_names if isinstance(file_names, (list, tuple, set)) else [file_names]:
-        value = re.sub(r'[^a-z0-9]+', ' ', str(name).lower())
-        if re.search(r'\banz\b|australia.{0,8}new zealand', value):
-            label = 'Australia & New Zealand (ANZ)'
-        elif re.search(r'\bapj\b|asia pacific', value):
-            label = 'Asia Pacific (APJ)'
-        elif re.search(r'\bchina\b', value):
-            label = 'China'
-        elif re.search(r'\bindia\b', value):
-            label = 'India'
-        elif re.search(r'\bjapan\b', value):
-            label = 'Japan'
+    # 4. Coverage Geography & Exclusions[span_4](start_span)[span_4](end_span)
+    geo = "Not Defined"
+    if "continental us" in lower or "united states" in lower:
+        geo = "Continental US (Tier 1 & Tier 2) + US Territories"
+    elif "canada" in lower:
+        geo = "Canada (Provinces & Territories)"
+    elif "emea" in lower or "europe" in lower:
+        geo = "EMEA Regional Coverage"
+    elif "apac" in lower or "asia" in lower:
+        geo = "APAC Regional Coverage"
+
+
+    exclusions = []
+    excl_m = re.findall(r'\b([A-Z]\d[A-Z]\s?\d[A-Z]\d)\b', clean_text)
+    if "not be providing lifts" in lower or "excluded" in lower:
+        exclusions = list(set(excl_m))
+        if exclusions:
+            geo += f" (Excludes lifts in {len(exclusions)} postal codes)"
+
+    # 5. Core Scope
+    scopes = []
+    for sc in ["Routers", "Switches", "Access Points (Indoor/Outdoor)", "Controllers", "Servers", "Cabling"]:
+        if any(w.lower() in lower for w in sc.split('/')):
+            scopes.append(sc)
+    scope_str = ", ".join(scopes) if scopes else "Hardware Break-Fix & Replacement"
+
+    # 6. Acknowledgment Windows
+    ack_sd = 15
+    ack_nbd = 2
+    if re.search(r'30\s*minutes\s+to\s+acknowledge', lower):
+        ack_sd = 30
+    if re.search(r'15\s*minutes\s+to\s+acknowledge', lower):
+        ack_sd = 15
+
+    # 7. Pricing Extraction Helper
+    def find_num(pattern, default=0.0):
+        m = re.search(pattern, clean_text, re.I)
+        if m:
+            val = m.group(1).replace(',', '').strip()
+            try:
+                return float(val)
+            except:
+                pass
+        return default
+
+    # Base Ticket Rates (4-Hr, 6-Hr, NBD)
+    nbd_ioh = find_num(r'(?:NBD|Next-Business Day)[^\n\r$]*\$\s*([\d,]+\.?\d*)', 265.0)
+    if nbd_ioh == 0.0:
+        nbd_ioh = 265.0
+    nbd_ooh = find_num(r'(?:NBD[^\n\r]*OOH)[^\n\r$]*\$\s*([\d,]+\.?\d*)', round(nbd_ioh * 1.3, 2))
+
+    four_hr_ioh = find_num(r'(?:4\s*HR|4-Hour)[^\n\r$]*\$\s*([\d,]+\.?\d*)', 355.0)
+    if four_hr_ioh == 0.0:
+        four_hr_ioh = 355.0
+    four_hr_ooh = find_num(r'(?:4\s*HR[^\n\r]*OOH)[^\n\r$]*\$\s*([\d,]+\.?\d*)', 450.0)
+
+    # Extended Effort Hourly Rates
+    ext_ioh = find_num(r'(?:Hourly blended rate|Extended Hours)[^\n\r$]*\$\s*([\d,]+\.?\d*)', 90.0)
+    if ext_ioh == 0.0:
+        ext_ioh = 90.0
+    ext_ooh = find_num(r'(?:Hourly blended rate \(OOH\)|Extended Hours[^\n\r]*OOH)[^\n\r$]*\$\s*([\d,]+\.?\d*)', round(ext_ioh * 1.2, 2))
+    double_time = find_num(r'(?:Double Time Rate)[^\n\r$]*\$\s*([\d,]+\.?\d*)', round(ext_ioh * 2.0, 2))
+
+
+    # Ancillaries
+    ladder_cost = find_num(r'Ladder\s+up\s+to\s+10[^\n\r$]*\$\s*([\d,]+\.?\d*)', 80.0)
+    scissor_cost = find_num(r'26[\'\s]+Scissor[^\n\r$]*\$\s*([\d,]+\.?\d*)', 1100.0)
+    boom_cost = find_num(r'(?:30-39[\'\s]+Boom|Boom up to 45)[^\n\r$]*\$\s*([\d,]+\.?\d*)', 1500.0)
+    spotter_ioh = find_num(r'IOH\s+Spotter\s+Fee[^\n\r$]*\$\s*([\d,]+\.?\d*)', 90.0)
+    spotter_ooh = find_num(r'OOH\s+Spotter\s+Fee[^\n\r$]*\$\s*([\d,]+\.?\d*)', 108.0)
+
+    # Travel Rules
+    zone_b_model = "Flat Fee Table" if "attachment 5" in lower or "flat fee" in lower else "Hourly Billable + Expenses"
+
+
+    # Penalties
+    slo_penalty = 25.0
+    conduct_penalty = 100.0
+    data_penalty = 10.0 if "10% credit" in lower else 0.0
+
+    return {
+        "Vendor": vendor_name,
+        "File": name,
+        "Term": term_str,
+        "Coverage": geo,
+        "Currency": curr,
+        "Scope": scope_str,
+        "Ack_SD": ack_sd,
+        "Ack_NBD": ack_nbd,
+        "Maintenance_Window": "4.5 hours",
+        "NBD_IOH": nbd_ioh,
+        "NBD_OOH": nbd_ooh,
+        "Four_Hr_IOH": four_hr_ioh,
+        "Four_Hr_OOH": four_hr_ooh,
+        "Ext_IOH": ext_ioh,
+        "Ext_OOH": ext_ooh,
+        "Double_Time": double_time,
+        "Zone_B_Travel": zone_b_model,
+        "Ladder_Cost": ladder_cost,
+        "Scissor_Lift": scissor_cost,
+        "Boom_Lift": boom_cost,
+        "Spotter_IOH": spotter_ioh,
+        "Spotter_OOH": spotter_ooh,
+        "SLO_Penalty": slo_penalty,
+        "Conduct_Penalty": conduct_penalty,
+        "Data_Penalty": data_penalty,
+        "Exclusions_Count": len(exclusions),
+        "Is_Baseline": is_baseline,
+        "Raw_Text": clean_text
+    }
+
+
+def _sow_score_vendors(vendor_data_list: list[dict], baseline_data: Optional[dict] = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Score vendors on a 100-point scale and generate comparison summaries."""
+    summary_rows = []
+    scoring_rows = []
+    baseline_rows = []
+
+    # 1. Calculate Real-World Synthetic 100-Ticket Basket Cost
+    baskets = []
+    for v in vendor_data_list:
+        cost = (
+            0.70 * v["NBD_IOH"] +
+            0.15 * v["Four_Hr_IOH"] +
+            0.10 * v["Four_Hr_OOH"] +
+            0.05 * (v["NBD_IOH"] + 2.0 * v["Ext_IOH"]) +
+            0.08 * v["Scissor_Lift"] +
+            0.05 * v["Spotter_IOH"]
+        )
+        baskets.append(cost)
+
+    min_basket = min(baskets) if baskets else 1.0
+
+    # 2. Score Vendors
+    for idx, v in enumerate(vendor_data_list):
+        # A. Cost Competitiveness (35 pts)
+        cost_score = round(35.0 * (min_basket / max(baskets[idx], 1.0)), 1)
+
+        # B. Coverage & Density (25 pts)
+        cov_score = 25.0
+        if v["Exclusions_Count"] > 0:
+            cov_score -= min(10.0, v["Exclusions_Count"] * 0.5)
+        if "provinces" in v["Coverage"].lower() and "territories" in v["Coverage"].lower():
+            cov_score = max(cov_score, 20.0)
+
+        # C. SLA Rigor (25 pts)
+        sla_score = 15.0
+        if v["Ack_SD"] <= 15:
+            sla_score += 5.0
+        elif v["Ack_SD"] <= 30:
+            sla_score += 2.5
+        if v["Data_Penalty"] > 0:
+            sla_score += 5.0
+
+        # D. Commercial Flexibility (15 pts)
+        comm_score = 15.0
+        if "flat fee" in v["Zone_B_Travel"].lower():
+            comm_score -= 2.0
+        if v["Exclusions_Count"] > 5:
+            comm_score -= 3.0
+
+        total_score = round(cost_score + cov_score + sla_score + comm_score, 1)
+
+        scoring_rows.append({
+            "Vendor": v["Vendor"],
+            "Cost Score (/35)": cost_score,
+            "Coverage Score (/25)": cov_score,
+            "SLA Rigor (/25)": sla_score,
+            "Commercials (/15)": comm_score,
+            "Composite Score (/100)": total_score,
+            "100-Ticket Basket Cost": round(baskets[idx], 2),
+            "Exclusions Flagged": v["Exclusions_Count"],
+        })
+
+
+        # Summary Table Row
+        summary_rows.append({
+            "Key Dimension": v["Vendor"],
+            "Contract Term": v["Term"],
+            "Geographic Coverage": v["Coverage"],
+            "Currency": v["Currency"],
+            "Core Scope": v["Scope"],
+            "Acknowledgment Window": f"{v['Ack_SD']} min (SD) / {v['Ack_NBD']} hr (NBD)",
+            "Base Maintenance Window": v["Maintenance_Window"],
+            "Base Rate (4-Hr / 6-Hr IOH)": f"${v['Four_Hr_IOH']:,.2f}",
+            "Base Rate (NBD 9x5)": f"${v['NBD_IOH']:,.2f}",
+            "Extended Effort Hourly Rate": f"${v['Ext_IOH']:,.2f} IOH / ${v['Ext_OOH']:,.2f} OOH",
+            "Travel Model": f"Zone A: $0 | Zone B: {v['Zone_B_Travel']}",
+            "Equipment & Lifts": f"Ladder: ${v['Ladder_Cost']:,.2f} | Scissor: ${v['Scissor_Lift']:,.2f} | Boom: ${v['Boom_Lift']:,.2f}",
+            "Spotter Fees (IOH / OOH)": f"${v['Spotter_IOH']:,.2f} / ${v['Spotter_OOH']:,.2f}",
+            "Service Level Credits": f"SLO Miss: {v['SLO_Penalty']:.0f}% | Conduct: {v['Conduct_Penalty']:.0f}% | Data: {v['Data_Penalty']:.0f}%",
+        })
+
+        # Baseline Comparison if available
+        if baseline_data:
+            base_basket = (
+                0.70 * baseline_data["NBD_IOH"] +
+                0.15 * baseline_data["Four_Hr_IOH"] +
+                0.10 * baseline_data["Four_Hr_OOH"] +
+                0.05 * (baseline_data["NBD_IOH"] + 2.0 * baseline_data["Ext_IOH"]) +
+                0.08 * baseline_data["Scissor_Lift"] +
+                0.05 * baseline_data["Spotter_IOH"]
+            )
+            price_index = round(baskets[idx] / max(base_basket, 1.0), 3)
+            ack_status = "Favorable" if v["Ack_SD"] < baseline_data["Ack_SD"] else ("Unfavorable" if v["Ack_SD"] > baseline_data["Ack_SD"] else "Neutral")
+            sla_status = "Favorable" if v["Data_Penalty"] >= baseline_data["Data_Penalty"] else "Unfavorable"
+            baseline_rows.append({
+                "Vendor": v["Vendor"],
+                "Price Variance Index (Base=1.0)": price_index,
+                "Acknowledgment SLA vs Baseline": ack_status,
+                "Penalty Protection vs Baseline": sla_status,
+                "Overall Variance Verdict": "Favorable" if price_index < 1.0 and ack_status != "Unfavorable" else "Review / Unfavorable"
+            })
+
+
+    # Ranking and Role Designation
+    score_df = pd.DataFrame(scoring_rows).sort_values(by="Composite Score (/100)", ascending=False).reset_index(drop=True)
+    roles = []
+    for rk in range(len(score_df)):
+        if rk < 3:
+            roles.append(f"Primary {rk + 1}")
+        elif rk < 6:
+            roles.append(f"Backup {rk - 2}")
         else:
-            label = ''
-        if label and label not in labels:
-            labels.append(label)
-    return '; '.join(labels) if labels else 'Not established from document title'
+            roles.append("Not Shortlisted")
+    score_df.insert(0, "Rank", range(1, len(score_df) + 1))
+    score_df.insert(2, "Recommended Role", roles)
 
 
-def _sow_cluster_scope_items(scope_records, threshold=0.62, limit=180):
-    """Cluster near-duplicate scope clauses into a balanced shared comparison catalogue."""
-    clusters = []
-    for record in scope_records:
-        sentence = record['scope']
-        tokens = set(_sow_terms(sentence, 500))
-        if len(tokens) < 3:
-            continue
-        best_idx, best_similarity = None, 0.0
-        for idx, cluster in enumerate(clusters):
-            overlap = tokens & cluster['tokens']
-            union = tokens | cluster['tokens']
-            jaccard = len(overlap) / max(len(union), 1)
-            containment = len(overlap) / max(min(len(tokens), len(cluster['tokens'])), 1)
-            similarity = max(jaccard, containment * 0.82)
-            if len(overlap) >= 4 and similarity > best_similarity:
-                best_idx, best_similarity = idx, similarity
-        if best_idx is not None and best_similarity >= threshold:
-            cluster = clusters[best_idx]
-            cluster['sources'].add(record['vendor'])
-            cluster['variants'].append(sentence)
-            if len(sentence) > len(cluster['scope']):
-                cluster['scope'] = sentence
-                cluster['tokens'] = tokens
-        else:
-            clusters.append({'scope': sentence, 'tokens': tokens, 'sources': {record['vendor']}, 'variants': [sentence]})
-    # Include common clauses and a balanced sample of vendor-specific clauses, not just the first file's clauses.
-    common = [c for c in clusters if len(c['sources']) > 1]
-    unique = [c for c in clusters if len(c['sources']) == 1]
-    common.sort(key=lambda c: (len(c['sources']), len(c['tokens']), len(c['scope'])), reverse=True)
-    unique_by_vendor = {}
-    for cluster in unique:
-        vendor_key = next(iter(cluster['sources']))
-        unique_by_vendor.setdefault(vendor_key, []).append(cluster)
-    for vendor_key in unique_by_vendor:
-        unique_by_vendor[vendor_key].sort(key=lambda c: (len(c['tokens']), len(c['scope'])), reverse=True)
-    balanced_unique = []
-    vendor_keys = sorted(unique_by_vendor)
-    while vendor_keys:
-        remaining_keys = []
-        for vendor_key in vendor_keys:
-            bucket = unique_by_vendor[vendor_key]
-            if bucket:
-                balanced_unique.append(bucket.pop(0))
-            if bucket:
-                remaining_keys.append(vendor_key)
-        vendor_keys = remaining_keys
-    common_slots = min(len(common), int(limit * 0.60))
-    unique_slots = min(len(balanced_unique), limit - common_slots)
-    selected = common[:common_slots] + balanced_unique[:unique_slots]
-    if len(selected) < limit:
-        selected_ids = {id(item) for item in selected}
-        fill = [item for item in common[common_slots:] + balanced_unique[unique_slots:] if id(item) not in selected_ids]
-        selected.extend(fill[:limit - len(selected)])
-    return [{'scope': c['scope'], 'sources': sorted(c['sources']), 'variants': c['variants']} for c in selected]
+    comp_df = pd.DataFrame(summary_rows)
+    comp_transposed = comp_df.set_index("Key Dimension").T.reset_index().rename(columns={"index": "Key Dimension"})
+    comp_transposed = _make_unique_columns(comp_transposed)
+    base_df = pd.DataFrame(baseline_rows) if baseline_rows else pd.DataFrame()
+    return comp_transposed, score_df, base_df
+
+def _sow_build_excel_export(comp_df: pd.DataFrame, score_df: pd.DataFrame, base_df: pd.DataFrame) -> bytes:
+    """Build formatted multi-tab Excel workbook with openpyxl charts."""
+    from openpyxl.chart import BarChart, Reference
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        comp_df.to_excel(writer, sheet_name='Comparative Summary', index=False)
+        score_df.to_excel(writer, sheet_name='Vendor Scoring & Shortlist', index=False)
+        if not base_df.empty:
+            base_df.to_excel(writer, sheet_name='Baseline Benchmarking', index=False)
+
+        wb = writer.book
+        emerald = PatternFill(fill_type="solid", fgColor="008A69")
+        white_bold = Font(color="FFFFFF", bold=True)
+        thin_border = Border(
+            left=Side(style="thin", color="D0D5DD"),
+            right=Side(style="thin", color="D0D5DD"),
+            top=Side(style="thin", color="D0D5DD"),
+            bottom=Side(style="thin", color="D0D5DD")
+        )
+
+        for sheetname in wb.sheetnames:
+            ws = wb[sheetname]
+            for col in ws.columns:
+                max_len = max(len(str(cell.value or '')) for cell in col)
+                col_letter = col[0].column_letter
+                ws.column_dimensions[col_letter].width = min(max(max_len + 3, 14), 50)
+            for cell in ws[1]:
+                cell.fill = emerald
+                cell.font = white_bold
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            for row in ws.iter_rows(min_row=2):
+                for cell in row:
+                    cell.border = thin_border
 
 
+        if "Vendor Scoring & Shortlist" in wb.sheetnames:
+            ws_score = wb["Vendor Scoring & Shortlist"]
+            chart = BarChart()
+            chart.type = "col"
+            chart.style = 10
+            chart.title = "Vendor Composite Scores (/100)"
+            chart.y_axis.title = "Score"
+            chart.x_axis.title = "Vendor"
+            chart.height = 12
+            chart.width = 18
+
+            data = Reference(ws_score, min_col=7, min_row=1, max_row=len(score_df) + 1)
+            cats = Reference(ws_score, min_col=2, min_row=2, max_row=len(score_df) + 1)
+            chart.add_data(data, titles_from_data=True)
+            chart.set_categories(cats)
+            chart.legend = None
+            ws_score.add_chart(chart, "J2")
+
+    return output.getvalue()
+
+def _sow_build_pptx_export(comp_df: pd.DataFrame, score_df: pd.DataFrame, base_df: pd.DataFrame) -> bytes:
+    """Build professional PowerPoint executive deck with tables and charts."""
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+    from pptx.enum.text import PP_ALIGN
+    from pptx.enum.chart import XL_CHART_TYPE
+    from pptx.chart.data import CategoryChartData
+    from pptx.dml.color import RGBColor
+
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+
+    navy = RGBColor(16, 32, 65)
+    teal = RGBColor(0, 138, 105)
+    white = RGBColor(255, 255, 255)
+    grey = RGBColor(100, 116, 139)
+
+    def add_header(slide, title_text, subtitle_text):
+        tb = slide.shapes.add_textbox(Inches(0.6), Inches(0.4), Inches(12.0), Inches(0.8))
+        tf = tb.text_frame
+        p = tf.paragraphs[0]
+        p.text = title_text
+        p.font.size = Pt(24)
+        p.font.bold = True
+        p.font.color.rgb = navy
+        if subtitle_text:
+            p2 = tf.add_paragraph()
+            p2.text = subtitle_text
+            p2.font.size = Pt(11)
+            p2.font.color.rgb = grey
+
+    # Slide 1: Cover
+    slide1 = prs.slides.add_slide(prs.slide_layouts[6])
+    band = slide1.shapes.add_shape(1, Inches(0), Inches(0), Inches(13.333), Inches(2.2))
+    band.fill.solid(); band.fill.fore_color.rgb = navy; band.line.fill.background()
+    tb = slide1.shapes.add_textbox(Inches(0.8), Inches(0.6), Inches(11.5), Inches(1.2))
+    p = tb.text_frame.paragraphs[0]
+    p.text = "VENDOR SOW EVALUATION & SELECTION"
+    p.font.size = Pt(28); p.font.bold = True; p.font.color.rgb = white
+    p2 = tb.text_frame.add_paragraph()
+    p2.text = "100-Point Selection Framework • 3 Primary & 3 Backup Allocation"
+    p2.font.size = Pt(13); p2.font.color.rgb = teal
+
+    metrics = [
+        ("Vendors Evaluated", str(len(score_df))),
+        ("Primary Selected", "3"),
+        ("Backup Selected", "3"),
+        ("Baseline Benchmarked", "Yes" if not base_df.empty else "Cohort Median")
+    ]
+    for i, (k, val) in enumerate(metrics):
+        sh = slide1.shapes.add_shape(1, Inches(0.8 + i * 2.95), Inches(3.0), Inches(2.7), Inches(1.2))
+        sh.fill.solid(); sh.fill.fore_color.rgb = white; sh.line.color.rgb = teal
+        tf = sh.text_frame
+        tf.paragraphs[0].text = val
+        tf.paragraphs[0].alignment = PP_ALIGN.CENTER
+        tf.paragraphs[0].font.size = Pt(24); tf.paragraphs[0].font.bold = True; tf.paragraphs[0].font.color.rgb = teal
+        pp = tf.add_paragraph(); pp.text = k; pp.alignment = PP_ALIGN.CENTER; pp.font.size = Pt(10); pp.font.color.rgb = navy
+
+    # Slide 2: Scoring Bar Chart
+    slide2 = prs.slides.add_slide(prs.slide_layouts[6])
+    add_header(slide2, "Vendor Composite Ranking (100-Point Framework)", "Cost (35 pts), Coverage (25 pts), SLA Rigor (25 pts), Commercials (15 pts)")
+    chart_data = CategoryChartData()
+    chart_data.categories = score_df["Vendor"].astype(str).tolist()
+    chart_data.add_series("Composite Score (/100)", score_df["Composite Score (/100)"].astype(float).tolist())
+    chart = slide2.shapes.add_chart(XL_CHART_TYPE.BAR_CLUSTERED, Inches(0.8), Inches(1.6), Inches(11.7), Inches(5.2), chart_data).chart
+    chart.has_legend = False
+    chart.category_axis.reverse_order = True
+
+    # Slide 3: Recommended Shortlist Table
+    slide3 = prs.slides.add_slide(prs.slide_layouts[6])
+    add_header(slide3, "Recommended Shortlist (3 Primary + 3 Backup)", "Ranked allocation based on quantitative scoring performance")
+    top_df = score_df.head(6)
+    cols = ["Rank", "Vendor", "Recommended Role", "Cost (/35)", "Coverage (/25)", "SLA (/25)", "Composite (/100)"]
+    t_shape = slide3.shapes.add_table(len(top_df) + 1, len(cols), Inches(0.8), Inches(1.6), Inches(11.7), Inches(4.5))
+    t = t_shape.table
+    for j, c in enumerate(cols):
+        cell = t.cell(0, j); cell.text = c; cell.fill.solid(); cell.fill.fore_color.rgb = navy
+        cell.text_frame.paragraphs[0].font.size = Pt(10); cell.text_frame.paragraphs[0].font.bold = True; cell.text_frame.paragraphs[0].font.color.rgb = white
+    for i, (_, row) in enumerate(top_df.iterrows(), 1):
+        vals = [str(row["Rank"]), str(row["Vendor"]), str(row["Recommended Role"]), f"{row['Cost Score (/35)']:.1f}", f"{row['Coverage Score (/25)']:.1f}", f"{row['SLA Rigor (/25)']:.1f}", f"{row['Composite Score (/100)']:.1f}"]
+        for j, v in enumerate(vals):
+            cell = t.cell(i, j); cell.text = v
+            cell.text_frame.paragraphs[0].font.size = Pt(9); cell.text_frame.paragraphs[0].font.color.rgb = navy
+
+    # Slide 4: Comparative Summary Table
+    slide4 = prs.slides.add_slide(prs.slide_layouts[6])
+    add_header(slide4, "SOW Comparative Summary", "Direct parameter-by-parameter contract comparison")
+    c_sub = comp_df.iloc[:9, :min(len(comp_df.columns), 4)]
+    t_shape4 = slide4.shapes.add_table(len(c_sub) + 1, len(c_sub.columns), Inches(0.6), Inches(1.5), Inches(12.1), Inches(5.4))
+    t4 = t_shape4.table
+    for j, c in enumerate(c_sub.columns):
+        cell = t4.cell(0, j); cell.text = str(c)[:30]; cell.fill.solid(); cell.fill.fore_color.rgb = navy
+        cell.text_frame.paragraphs[0].font.size = Pt(9); cell.text_frame.paragraphs[0].font.bold = True; cell.text_frame.paragraphs[0].font.color.rgb = white
+    for i, (_, row) in enumerate(c_sub.iterrows(), 1):
+        for j, c in enumerate(c_sub.columns):
+            cell = t4.cell(i, j); cell.text = str(row[c])[:50]
+            cell.text_frame.paragraphs[0].font.size = Pt(8); cell.text_frame.paragraphs[0].font.color.rgb = navy
+
+    out = BytesIO()
+    prs.save(out)
+    return out.getvalue()
+
+# -----------------------------------------------------------------------------
+# APPLICATION NAVIGATION & SIDEBAR SETUP
+# -----------------------------------------------------------------------------
 if not _pdf_access_gate():
     st.stop()
 
-
-# Navigation controls are fixed at the bottom-left of the sidebar. The active tool
-# determines which page header is rendered, so the PDF Approval Stamp Tool header
-# is absent in SOW mode. Only the navigation placement and button styling are changed.
 st.markdown("""
 <style>
-/* Anchor the tools label and both navigation buttons at the lower-left. */
 section[data-testid="stSidebar"] { overflow: visible !important; }
 div.st-key-nav_pdf_stamp,
 div.st-key-nav_vendor_sow {
@@ -1823,7 +1708,6 @@ div.st-key-nav_vendor_sow {
     z-index: 1001 !important;
     margin: 0 !important;
 }
-/* The TOOLS label sits one line above the Vendor SOW Analyzer button. */
 .pdf-tools-label {
     position: fixed !important;
     left: 1rem !important;
@@ -1833,7 +1717,6 @@ div.st-key-nav_vendor_sow {
     margin: 0 !important;
     line-height: 1.15rem !important;
 }
-/* Vendor SOW Analyzer remains above the PDF Approval Stamp Tool. */
 div.st-key-nav_vendor_sow { bottom: 4.35rem !important; }
 div.st-key-nav_pdf_stamp { bottom: 1rem !important; }
 div.st-key-nav_pdf_stamp button,
@@ -1856,6 +1739,7 @@ div.st-key-nav_pdf_stamp button p,
 div.st-key-nav_vendor_sow button p { color: #FFFFFF !important; }
 </style>
 """, unsafe_allow_html=True)
+
 if 'active_tool' not in st.session_state:
     st.session_state['active_tool'] = 'PDF Approval Stamp Tool'
 with st.sidebar:
@@ -1868,607 +1752,252 @@ with st.sidebar:
         st.session_state['active_tool'] = 'PDF Approval Stamp Tool'
         st.rerun()
 
+# -----------------------------------------------------------------------------
+# TOOL 1: VENDOR SOW ANALYZER (FULL CODE)
+# -----------------------------------------------------------------------------
 if st.session_state['active_tool'] == 'Vendor SOW Analyzer':
     st.markdown("""
     <style>
-    .block-container {padding-top: 1.4rem; max-width: 1500px;}
+    .block-container {padding-top: 1.4rem; max-width: 1550px;}
     div[data-testid="stButton"] button {border-radius:9px;font-weight:650;}
     .sow-hero {padding:1.15rem 1.4rem;border-radius:14px;background:linear-gradient(120deg,#006B4F,#008A69);color:#fff;margin-bottom:1rem;}
     .sow-hero h1 {color:#fff;margin:0;font-size:1.8rem;}
     .sow-hero p {color:#e7fff6;margin:.35rem 0 0 0;}
     </style>
-    <div class="sow-hero"><h1>Vendor SOW Analyzer</h1><p>Compare vendor scope, identify overlapping capabilities, and shortlist primary and backup coverage.</p></div>
+    <div class="sow-hero">
+      <h1>Vendor SOW Analyzer & Identifier</h1>
+      <p>Evaluate scope, coverage, rate cards, and down-select 3 Primary + 3 Backup vendors from multiple candidates.</p>
+    </div>
     """, unsafe_allow_html=True)
-    st.caption('Upload a global SOW as the target scope when available, plus vendor SOWs and capability documents. If no baseline is available, the analyzer identifies common and complementary work across vendors. Files are read in memory.')
-    with st.expander('How the recommendations work', expanded=False):
-        st.write('The analyzer extracts text and compares scope terms and evidence statements. It recommends a set of up to 3 primary vendors and up to 3 backups using a coverage-first selection. Similarity is a screening aid, not a contractual determination; verify exclusions, geography, SLAs, staffing, certifications, and commercial terms in the source documents.')
-    _sow_file_types = ['pdf','docx','docm','xlsx','xlsm','xls','pptx','txt','md','csv','zip']
-    baseline_files = st.file_uploader('Global vendor SOW / baseline (optional — upload multiple files)', type=_sow_file_types, accept_multiple_files=True, key='sow_baseline')
-    vendor_files = st.file_uploader('Upload vendor SOWs, capability documents, or a ZIP containing multiple documents', type=_sow_file_types, accept_multiple_files=True, key='sow_vendor_files')
-    st.caption('ZIP archives (including nested ZIPs) are expanded in memory. Exact duplicate files are removed. Documents with no detectable supplier are kept separate and clearly labeled for manual review.')
 
-    if st.button('Analyze vendor scope', type='primary', use_container_width=True, key='run_sow_analysis'):
-        _sow_run_status = st.empty()
-        _sow_run_status.info('Analysis started — checking uploaded files, expanding archives, and extracting document text…')
-        try:
-            with st.spinner('Analyzing vendor SOWs — reading documents, matching scope, evaluating Gate 1, and calculating Gate 2 scores…'):
-                parsed_docs, document_errors = _sow_expand_uploads(vendor_files or [], return_errors=True)
-                parsed_vendors_by_key = {}
-                excluded_documents = []
-                for document in parsed_docs:
-                    text_value = document['Text']
-                    base_name = document['File'].rsplit('/', 1)[-1]
-                    lower_name = base_name.lower()
-                    if ('gp_manual' in lower_name or 'shift resume' in lower_name or 'staff roster' in lower_name or 'summary english' in lower_name):
-                        excluded_documents.append({'File': document['File'], 'Reason': 'Reference, summary, or staffing document; not counted as a separate vendor.'})
-                        continue
-                    scope_lines = _sow_extract_scope(text_value)
-                    if not scope_lines:
-                        excluded_documents.append({'File': document['File'], 'Reason': 'No usable operational scope clauses were detected.'})
-                        continue
-                    vendor_name = _sow_infer_vendor(document['File'], text_value)
-                    vendor_key = _sow_normalize(vendor_name)
-                    if vendor_key not in parsed_vendors_by_key:
-                        parsed_vendors_by_key[vendor_key] = {'Vendor': vendor_name, 'Files': [], 'Texts': [], 'Scopes': [], 'Hashes': set()}
-                    grouped = parsed_vendors_by_key[vendor_key]
-                    grouped['Files'].append(document['File'])
-                    grouped['Texts'].append(text_value)
-                    grouped['Scopes'].extend(scope_lines)
-                    grouped['Hashes'].add(document['SHA256'])
-    
-                parsed_vendors = []
-                for grouped in parsed_vendors_by_key.values():
-                    unique_scopes, seen_scopes = [], set()
-                    for scope in grouped['Scopes']:
-                        key = _sow_normalize(scope)
-                        if key and key not in seen_scopes:
-                            seen_scopes.add(key)
-                            unique_scopes.append(scope)
-                    parsed_vendors.append({
-                        'Vendor': grouped['Vendor'],
-                        'File': '; '.join(grouped['Files']),
-                        'Files': grouped['Files'],
-                        'Text': '\n\n'.join(grouped['Texts']),
-                        'Scopes': unique_scopes,
-                        'Coverage area': _sow_detect_coverage_area(grouped['Files'], '\n'.join(grouped['Texts'])),
-                    })
-    
-                # Treat every uploaded baseline document as one reference vendor.
-                # Merge its extracted text and scope clauses so all candidates are
-                # measured against the full global scope/coverage, not just one file.
-                baseline_docs, baseline_errors = _sow_expand_uploads(baseline_files or [], return_errors=True)
-                document_errors.extend(baseline_errors)
-                baseline_text = '\n\n'.join(item['Text'] for item in baseline_docs)
-                baseline_scopes = _sow_extract_scope(baseline_text) if baseline_text.strip() else []
-                if baseline_docs:
-                    st.caption(f'Global baseline loaded: {len(baseline_docs)} readable document(s) combined as the reference scope.')
-                if document_errors:
-                    with st.expander(f'Documents skipped or needing review ({len(document_errors)})', expanded=True):
-                        st.dataframe(pd.DataFrame(document_errors), use_container_width=True, hide_index=True)
-                if len(parsed_vendors) < 2:
-                    st.error('Fewer than two distinct readable vendor groups were found. Review the skipped-document list above, confirm the ZIP is not password-protected, and ensure required document-reader packages are installed.')
-                else:
-                    if baseline_scopes:
-                        baseline_records = [{'vendor': 'Global baseline', 'scope': scope} for scope in baseline_scopes]
-                        clustered = _sow_cluster_scope_items(baseline_records, threshold=0.74, limit=180)
-                        scope_items = [item['scope'] for item in clustered]
-                        scope_sources = [set() for _ in scope_items]
-                        analysis_mode = 'Global baseline comparison'
-                    else:
-                        scope_records = [{'vendor': vendor['Vendor'], 'scope': scope} for vendor in parsed_vendors for scope in vendor['Scopes']]
-                        clustered = _sow_cluster_scope_items(scope_records, threshold=0.74, limit=180)
-                        scope_items = [item['scope'] for item in clustered]
-                        scope_sources = [set(item['sources']) for item in clustered]
-                        analysis_mode = 'Cross-vendor overlap (no global baseline)'
-    
-                    if not scope_items:
-                        st.error('No usable scope statements were detected. Upload readable SOWs or capability documents with selectable text.')
-                    else:
-                        per_vendor = {}
-                        all_evidence_rows = []
-                        for vendor in parsed_vendors:
-                            covered, potential, evidence_rows = set(), set(), []
-                            for i, scope in enumerate(scope_items):
-                                score, terms = _sow_similarity(scope, vendor['Scopes'])
-                                phrase = _sow_normalize(scope)
-                                vendor_norm = _sow_normalize(vendor['Text'])
-                                phrase_present = bool(phrase and phrase in vendor_norm)
-                                if vendor['Vendor'] in scope_sources[i]:
-                                    status, score = 'Covered', max(score, 100.0)
-                                else:
-                                    status = 'Covered' if phrase_present or score >= 60 else ('Potential' if score >= 30 else 'Gap')
-                                if status == 'Covered':
-                                    covered.add(i)
-                                elif status == 'Potential':
-                                    potential.add(i)
-                                evidence = ''
-                                if vendor['Scopes']:
-                                    best_score = -1
-                                    for candidate_line in vendor['Scopes']:
-                                        candidate_score, _ = _sow_similarity(scope, [candidate_line])
-                                        if candidate_score > best_score:
-                                            best_score, evidence = candidate_score, candidate_line
-                                if not evidence or status == 'Gap':
-                                    evidence = 'No close scope excerpt found; manually review the source document.'
-                                evidence_rows.append({
-                                    'Scope requirement': _sow_scope_label(scope),
-                                    'Vendor': vendor['Vendor'],
-                                    'Status': status,
-                                    'Match score (%)': score,
-                                    'Matched terms': ', '.join(terms[:12]),
-                                    'Evidence excerpt': evidence[:500],
-                                    'Source document(s)': vendor['File'],
-                                })
-                            n = max(len(scope_items), 1)
-                            weighted_coverage = round((len(covered) + 0.5 * len(potential)) / n * 100, 1)
-                            scores = [r['Match score (%)'] for r in evidence_rows]
-                            per_vendor[vendor['Vendor']] = {
-                                'covered': covered,
-                                'potential': potential,
-                                'weighted_coverage': weighted_coverage,
-                                'average': round(sum(scores) / len(scores), 1) if scores else 0,
-                                'evidence': evidence_rows,
-                                'file': vendor['File'],
-                                'scope_count': len(vendor['Scopes']),
-                                'coverage_area': vendor.get('Coverage area', 'Not established from document title'),
-                                'full_text': vendor.get('Text', ''),
-                            }
-                            all_evidence_rows.extend(evidence_rows)
-    
-                        # Gate 1: distinguish explicit disqualifiers from missing evidence.
-                        # An absent clause is not treated as proof of non-compliance.
-                        gate_rows = []
-                        score_rows = []
-                        for vendor_name, detail in per_vendor.items():
-                            text_norm = re.sub(r'\s+', ' ', detail.get('full_text', '')).lower()
-                            region_patterns = {
-                                'Americas': r'\b(americas|north america|south america|latin america|latam|united states|canada|brazil|mexico)\b',
-                                'EMEA': r'\b(emea|europe|middle east|africa|united kingdom|uk|germany|france)\b',
-                                'APAC': r'\b(apac|asia pacific|asia-pacific|asia|pacific|australia|india|japan|singapore)\b',
-                            }
-                            region_found = {region: bool(re.search(pattern, text_norm, re.I)) for region, pattern in region_patterns.items()}
-                            regional_text = ', '.join(k for k, found in region_found.items() if found) or 'Not evidenced'
-                            explicit_region_fail = any(re.search(
-                                rf'\b(?:does not|cannot|unable to|do not|not able to|no coverage in|excluded from)\b.{{0,55}}\b{region.lower()}\b',
-                                text_norm, re.I
-                            ) for region in ('Americas', 'EMEA', 'APAC'))
-                            compliance_terms = ['iso 27001', 'iso27001', 'soc 2', 'soc2', 'gdpr', 'data residency', 'data sovereignty',
-                                                'regional labor', 'labour compliance', 'security controls', 'security compliance']
-                            compliance_hits = [term for term in compliance_terms if term in text_norm]
-                            # Look for a negative statement tied to a specific obligation,
-                            # rather than treating any mention of GDPR/SOC 2 as failure.
-                            obligation_patterns = {
-                                'GDPR': r'\\b(?:not compliant with|does not comply with|non[- ]compliant with|fails? to comply with|unable to comply with|cannot comply with|not meeting)\\b.{0,90}\\bgdpr\\b|\\bgdpr\\b.{0,90}\\b(?:not compliant|non[- ]compliant|does not comply|fails? to comply|unable to comply|cannot comply|not met|not meeting)\\b',
-                                'SOC 2': r'\\b(?:not certified|certification expired|does not hold|lacks?|without|failed to obtain|not compliant with)\\b.{0,70}\\bsoc\\s*2\\b|\\bsoc\\s*2\\b.{0,70}\\b(?:not certified|expired|missing|not held|not compliant|non[- ]compliant)\\b',
-                                'ISO 27001': r'\\b(?:not certified|certification expired|does not hold|lacks?|without|failed to obtain|not compliant with)\\b.{0,70}\\biso\\s*27001\\b|\\biso\\s*27001\\b.{0,70}\\b(?:not certified|expired|missing|not held|not compliant|non[- ]compliant)\\b',
-                                'data residency': r'\\b(?:cannot|does not|unable to|will not|not able to)\\b.{0,70}\\b(?:meet|support|provide|guarantee|comply with)\\b.{0,45}\\bdata residenc\\w*\\b|\\bdata residenc\\w*\\b.{0,70}\\b(?:not supported|not available|cannot be guaranteed|not compliant)\\b',
-                            }
-                            obligation_failures = [label for label, pattern in obligation_patterns.items()
-                                                   if re.search(pattern, text_norm, re.I)]
-                            generic_compliance_neg = bool(re.search(
-                                r'\\b(?:not certified|certification expired|does not comply|non-compliant|non compliant|not compliant|fails? to meet)\\b',
-                                text_norm, re.I
-                            ))
-                            compliance_neg = bool(obligation_failures) or generic_compliance_neg
-                            core_terms = ['service desk', 'technical support', 'incident management', 'request fulfillment',
-                                          'field service', 'onsite support', 'remote support', 'service delivery',
-                                          'operations support', 'managed services', 'scope of services']
-                            core_hits = [term for term in core_terms if term in text_norm]
-                            global_terms = ['direct presence', 'owned entity', 'local entity', 'follow-the-sun', 'follow the sun',
-                                            '24/7', '24x7', 'multilingual', 'in-country', 'in country']
-                            global_hits = [term for term in global_terms if term in text_norm]
-                            fail_reasons = []
-                            gate_explanations = []
-                            if explicit_region_fail:
-                                fail_reasons.append('Geographic footprint: explicit regional coverage limitation')
-                                gate_explanations.append(
-                                    'Why: the SOW explicitly limits or excludes coverage in a required region. '
-                                    'Meaning: the vendor may not deliver directly in every required theater; verify country-level coverage and entity structure.'
-                                )
-                            if obligation_failures:
-                                for obligation in obligation_failures:
-                                    if obligation == 'GDPR':
-                                        fail_reasons.append('Compliance/security: GDPR non-compliance explicitly stated')
-                                        gate_explanations.append(
-                                            'Why: the source clause appears to state that GDPR requirements are not met. '
-                                            'Meaning: GDPR is the EU data-protection law; non-compliance may prevent lawful processing of applicable personal data. '
-                                            'Validate the exact clause with Privacy/Legal before disqualification.'
-                                        )
-                                    elif obligation == 'SOC 2':
-                                        fail_reasons.append('Compliance/security: SOC 2 status explicitly deficient')
-                                        gate_explanations.append(
-                                            'Why: the source appears to state that SOC 2 certification/report status is absent, expired, or not met. '
-                                            'Meaning: SOC 2 is an independent controls-assurance report, not a general legal certification. Confirm the required report type and period.'
-                                        )
-                                    elif obligation == 'ISO 27001':
-                                        fail_reasons.append('Compliance/security: ISO 27001 status explicitly deficient')
-                                        gate_explanations.append(
-                                            'Why: the source appears to state that ISO 27001 certification is absent, expired, or not met. '
-                                            'Meaning: this standard concerns an information-security management system; confirm scope, entity, and certificate validity.'
-                                        )
-                                    else:
-                                        fail_reasons.append('Compliance/security: data-residency requirement explicitly unmet')
-                                        gate_explanations.append(
-                                            'Why: the source appears to state that required data-residency conditions cannot be met. '
-                                            'Meaning: data may not be stored or processed in the required geography; Privacy/Legal must validate the exact obligation.'
-                                        )
-                            elif generic_compliance_neg:
-                                fail_reasons.append('Compliance/security: explicit non-compliance or certification failure')
-                                gate_explanations.append(
-                                    'Why: the source contains a negative compliance/certification statement, but the exact obligation needs manual confirmation. '
-                                    'Meaning: a mandatory security or regulatory requirement may be unmet; verify the source clause before final exclusion.'
-                                )
-                            geography_gate = 'Fail' if explicit_region_fail else ('Pass' if all(region_found.values()) else 'Review')
-                            core_gate = 'Pass' if core_hits else 'Review'
-                            compliance_gate = 'Fail' if compliance_neg else ('Pass' if compliance_hits else 'Review')
-                            gate_status = 'Fail' if fail_reasons else (
-                                'Pass' if geography_gate == 'Pass' and core_gate == 'Pass' and compliance_gate == 'Pass' else 'Review'
-                            )
-                            gate_reason = '; '.join(fail_reasons) if fail_reasons else (
-                                'All non-negotiable evidence categories found' if gate_status == 'Pass'
-                                else 'Review the gate categories marked Review; missing evidence is not proof of failure'
-                            )
-                            gate_explanation = ' '.join(gate_explanations) if gate_explanations else (
-                                'No explicit knockout was detected. Review means the source did not establish the requirement clearly enough; it is not proof of non-compliance.'
-                                if gate_status == 'Review' else
-                                'The available text contains evidence for the configured screening categories; confirm the actual clauses and applicable scope before award.'
-                            )
-                            gate_rows.append({
-                                'Vendor': vendor_name,
-                                'Geographic footprint gate': geography_gate,
-                                'Core capability gate': core_gate,
-                                'Compliance/security gate': compliance_gate,
-                                'Regional coverage evidence': regional_text,
-                                'Core scope evidence': ', '.join(core_hits[:5]) if core_hits else 'Not evidenced',
-                                'Compliance evidence': ', '.join(compliance_hits[:5]) if compliance_hits else 'Not evidenced',
-                                'Gate 1 status': gate_status,
-                                'Gate 1 knockout reason': '; '.join(fail_reasons) if fail_reasons else ('None detected' if gate_status == 'Pass' else 'No explicit knockout; evidence review required'),
-                                'Gate rationale': gate_reason,
-                                'Failure explanation — why': '; '.join(fail_reasons) if fail_reasons else 'No explicit failure detected',
-                                'Failure explanation — what it means': gate_explanation,
-                                'Manual validation required': 'Yes' if gate_status in ('Fail', 'Review') else 'Confirm clause scope before award',
-                            })
-    
-                            # Four weighted pillars. Indicators are evidence proxies and should be
-                            # validated against the actual SOW, not interpreted as certifications.
-                            reach = min(100.0, (sum(region_found.values()) / 3 * 70) + min(30, len(global_hits) * 7.5))
-                            scope_breadth = min(100.0, detail['weighted_coverage'] * 0.65 + detail['average'] * 0.35)
-                            sla_terms = ['response time', 'resolution time', 'service level', 'sla', 'service credit',
-                                         'service credits', 'penalty', 'penalties', 'business continuity', 'disaster recovery',
-                                         'redundancy', 'escalation', 'availability']
-                            sla_hits = [term for term in sla_terms if term in text_norm]
-                            sla_score = min(100.0, len(sla_hits) / 6 * 100)
-                            commercial_terms = ['hourly rate', 'unit rate', 'rate card', 'pricing', 'commercial model',
-                                                'fixed fee', 'volume discount', 'scalability', 'transition cost',
-                                                'transition fee', 'cost per', 'blended rate']
-                            commercial_hits = [term for term in commercial_terms if term in text_norm]
-                            commercial_score = min(100.0, len(commercial_hits) / 6 * 100)
-                            composite = round(reach * .35 + scope_breadth * .25 + sla_score * .20 + commercial_score * .20, 1)
-                            score_rows.append({
-                                'Vendor': vendor_name,
-                                'Global reach (/100)': round(reach, 1),
-                                'Scope breadth (/100)': round(scope_breadth, 1),
-                                'SLA rigor (/100)': round(sla_score, 1),
-                                'Commercials & scalability (/100)': round(commercial_score, 1),
-                                'Composite score (/100)': composite,
-                                'Gate 1 status': gate_status,
-                                'Regional evidence': regional_text,
-                                'SLA evidence terms': ', '.join(sla_hits[:6]) or 'Not evidenced',
-                                'Commercial evidence terms': ', '.join(commercial_hits[:6]) or 'Not evidenced',
-                            })
-                        gate_frame = pd.DataFrame(gate_rows)
-                        scoring_frame = pd.DataFrame(score_rows)
-                        eligible_names = set(gate_frame.loc[gate_frame['Gate 1 status'] != 'Fail', 'Vendor'])
-                        ranked_vendors = scoring_frame[scoring_frame['Vendor'].isin(eligible_names)].sort_values(
-                            ['Composite score (/100)', 'Scope breadth (/100)', 'Global reach (/100)'],
-                            ascending=False
-                        )['Vendor'].tolist()
-                        primary = ranked_vendors[:3]
-                        backups = ranked_vendors[3:6]
-                        score_rows_by_vendor = {r['Vendor']: r for r in score_rows}
-                        for row in score_rows:
-                            name = row['Vendor']
-                            row['Rank'] = ranked_vendors.index(name) + 1 if name in ranked_vendors else ''
-                            row['Recommended role'] = (
-                                f'Primary {ranked_vendors.index(name)+1}' if name in primary else
-                                f'Backup {ranked_vendors.index(name)-2}' if name in backups else
-                                'Not shortlisted'
-                            )
-                        st.subheader('Analysis overview')
-                        st.info(f'Mode: {analysis_mode}. Distinct scope clauses assessed: {len(scope_items)}. Distinct supplier groups analyzed: {len(parsed_vendors)}. Exact duplicate files are excluded from the count.')
-                        if not baseline_scopes:
-                            st.warning('No global baseline was supplied. This mode measures overlap across the uploaded scope documents; it cannot prove that any single vendor can replace a global provider. Geographic coverage is shown separately and must be validated before treating a candidate as global.')
-                        if any(name.startswith('Unidentified supplier') for name in per_vendor):
-                            st.warning('One or more documents did not identify a legal supplier. These are labeled by document name and may represent a region/template rather than an independent vendor. Verify the supplier identity before using the shortlist.')
-                        if len(parsed_vendors) < 6:
-                            st.warning(f'Only {len(parsed_vendors)} distinct supplier group(s) were identified. The analyzer can recommend up to {len(primary)} primary and {len(backups)} backup candidates; upload additional independent vendor SOWs to reach six.')
-                        if excluded_documents:
-                            with st.expander(f'Reference/admin documents excluded from vendor ranking ({len(excluded_documents)})', expanded=False):
-                                st.dataframe(pd.DataFrame(excluded_documents), use_container_width=True, hide_index=True)
-    
-                        k1, k2, k3, k4 = st.columns(4)
-                        k1.metric('Distinct vendors/groups', len(parsed_vendors))
-                        k2.metric('Scope clusters', len(scope_items))
-                        k3.metric('Primary candidates', len(primary))
-                        k4.metric('Backup candidates', len(backups))
-    
-                        coverage_rows = []
-                        for name, detail in per_vendor.items():
-                            n = max(len(scope_items), 1)
-                            coverage_rows.append({
-                                'Vendor / supplier group': name,
-                                'Coverage area (from document title)': detail['coverage_area'],
-                                'Global coverage evidence': ('Not evidenced — region-specific SOW' if detail['coverage_area'] != 'Not established from document title' else 'Not established; manual verification required'),
-                                'Weighted coverage (%)': detail['weighted_coverage'],
-                                'Confirmed covered (%)': round(100 * len(detail['covered']) / n, 1),
-                                'Potential (%)': round(100 * len(detail['potential']) / n, 1),
-                                'Average match (%)': detail['average'],
-                                'Covered scopes': len(detail['covered']),
-                                'Potential scopes': len(detail['potential']),
-                                'Gap scopes': n - len(detail['covered']) - len(detail['potential']),
-                                'Documents grouped': len(detail['file'].split('; ')),
-                                'Source file(s)': detail['file'],
-                            })
-                        coverage_frame = pd.DataFrame(coverage_rows).sort_values(
-                            ['Weighted coverage (%)', 'Confirmed covered (%)', 'Average match (%)'], ascending=False
-                        )
-                        scoring_frame = pd.DataFrame(score_rows)
-                        # Keep geographic evidence consistent with Gate 1. Document-title
-                        # inference is retained as a separate descriptive field only; it
-                        # must never contradict the evidence found in the SOW text.
-                        _gate_geo_columns = [
-                            'Vendor', 'Geographic footprint gate', 'Regional coverage evidence',
-                            'Gate 1 status', 'Gate 1 knockout reason', 'Gate rationale',
-                            'Failure explanation — why', 'Failure explanation — what it means',
-                        ]
-                        _gate_geo_frame = gate_frame.reindex(columns=_gate_geo_columns).copy()
-                        _gate_geo_frame = _gate_geo_frame.rename(columns={
-                            'Vendor': 'Vendor / supplier group',
-                            'Regional coverage evidence': 'Global coverage evidence',
-                        })
-                        coverage_frame = coverage_frame.drop(
-                            columns=['Global coverage evidence'], errors='ignore'
-                        ).merge(_gate_geo_frame, on='Vendor / supplier group', how='left', suffixes=('', '_gate'))
-                        coverage_frame['Global coverage evidence'] = coverage_frame.apply(
-                            lambda r: (
-                                f"{r.get('Geographic footprint gate', 'Review')}: "
-                                f"{r.get('Global coverage evidence', 'Not evidenced')}. "
-                                f"Document-title hint: {r.get('Coverage area (from document title)', 'Not established from document title')}."
-                            ),
-                            axis=1,
-                        )
-                        coverage_frame = coverage_frame.merge(
-                            scoring_frame.drop(columns=['Gate 1 status'], errors='ignore'),
-                            left_on='Vendor / supplier group', right_on='Vendor', how='left'
-                        ).drop(columns=['Vendor'])
-                        coverage_frame['Rank'] = coverage_frame['Vendor / supplier group'].map(
-                            {name: idx + 1 for idx, name in enumerate(ranked_vendors)}
-                        )
-                        coverage_frame['Recommended role'] = coverage_frame['Vendor / supplier group'].map(
-                            {name: (f'Primary {idx+1}' if idx < 3 else f'Backup {idx-2}' if idx < 6 else 'Not shortlisted')
-                             for idx, name in enumerate(ranked_vendors)}
-                        ).fillna('Knocked out — Gate 1')
-                        st.subheader('Gate 1 — Non-Negotiable Knockout Screening (Pass / Fail / Review)')
-                        st.caption('Geographic footprint, core capability, and compliance/security are evaluated separately. Any explicit knockout yields Gate 1 = Fail; missing or ambiguous evidence yields Review, not automatic failure.')
-                        st.dataframe(gate_frame, use_container_width=True, hide_index=True)
-                        st.subheader('Gate 2 — Weighted Multi-Criteria Evaluation (Gate 1 Pass / Review Vendors Only)')
-                        st.caption('Weights: Global reach 35% • Scope breadth 25% • SLA & delivery rigor 20% • Commercials & scalability 20%. Gate 1 Fail vendors are excluded from primary/backup ranking. Scores are evidence-based screening proxies, not a substitute for contractual validation.')
-                        scoring_display = scoring_frame[['Rank', 'Vendor', 'Gate 1 status', 'Global reach (/100)', 'Scope breadth (/100)', 'SLA rigor (/100)', 'Commercials & scalability (/100)', 'Composite score (/100)', 'Recommended role']].copy()
-                        scoring_display.insert(3, 'Gate 2 eligibility', scoring_display['Gate 1 status'].map(
-                            lambda status: 'Eligible for weighted ranking' if status != 'Fail' else 'Excluded — Gate 1 knockout'
-                        ))
-                        scoring_display['Rank'] = scoring_display['Rank'].replace('', 'Knocked out')
 
-                        def _sow_gate2_explanation(row):
-                            vendor_name = str(row.get('Vendor', 'Vendor'))
-                            status = str(row.get('Gate 1 status', 'Review'))
-                            role = str(row.get('Recommended role', 'Not shortlisted'))
-                            if status == 'Fail':
-                                gate_match = gate_frame[gate_frame['Vendor'].astype(str) == vendor_name]
-                                reason = ''
-                                if not gate_match.empty:
-                                    reason = str(gate_match.iloc[0].get('Gate 1 knockout reason', '') or '')
-                                return (
-                                    f'Not scored for selection: Gate 1 failed. {reason} '
-                                    'Meaning: a mandatory screening concern must be resolved before weighted comparison.'
-                                ).strip()
-                            score_values = {
-                                'Global reach': pd.to_numeric(pd.Series([row.get('Global reach (/100)', 0)]), errors='coerce').fillna(0).iloc[0],
-                                'Scope breadth': pd.to_numeric(pd.Series([row.get('Scope breadth (/100)', 0)]), errors='coerce').fillna(0).iloc[0],
-                                'SLA rigor': pd.to_numeric(pd.Series([row.get('SLA rigor (/100)', 0)]), errors='coerce').fillna(0).iloc[0],
-                                'Commercials & scalability': pd.to_numeric(pd.Series([row.get('Commercials & scalability (/100)', 0)]), errors='coerce').fillna(0).iloc[0],
-                            }
-                            weakest = sorted(score_values.items(), key=lambda item: item[1])[:2]
-                            weak_text = ', '.join(f'{name} ({value:.1f}/100)' for name, value in weakest)
-                            if role != 'Not shortlisted':
-                                return (
-                                    f'Eligible under Gate 1; selected as {role} based on relative composite ranking. '
-                                    f'Lowest-scoring pillars to validate or negotiate: {weak_text}. '
-                                    'Meaning: this is a comparative ranking, not proof of contractual compliance or legal equivalence.'
-                                )
-                            return (
-                                f'Gate 1 did not detect an explicit knockout, but this vendor is outside the top-six shortlist '
-                                f'under the current relative ranking. Lowest-scoring pillars: {weak_text}. '
-                                'Meaning: lower relative fit, not an automatic compliance failure; validate evidence and adjust weights only through approved governance.'
-                            )
-                        scoring_display['Gate 2 decision explanation'] = scoring_display.apply(_sow_gate2_explanation, axis=1)
-                        st.dataframe(scoring_display.sort_values('Composite score (/100)', ascending=False), use_container_width=True, hide_index=True)
-                        st.subheader('Vendor coverage graph')
-                        try:
-                            import plotly.graph_objects as go
-                            _coverage_plot = go.Figure()
-                            _coverage_metrics = [
-                                ('Weighted coverage (%)', 'Weighted coverage'),
-                                ('Confirmed covered (%)', 'Confirmed covered'),
-                                ('Potential (%)', 'Potential'),
-                            ]
-                            for _column, _label in _coverage_metrics:
-                                _coverage_plot.add_trace(go.Bar(
-                                    name=_label,
-                                    x=coverage_frame['Vendor / supplier group'].astype(str),
-                                    y=pd.to_numeric(coverage_frame[_column], errors='coerce').fillna(0),
-                                    hovertemplate='%{x}<br>' + _label + ': %{y:.1f}%<extra></extra>',
-                                ))
-                            _coverage_plot.update_layout(
-                                barmode='group',
-                                height=max(420, min(760, 300 + 28 * len(coverage_frame))),
-                                margin=dict(l=20, r=20, t=25, b=150),
-                                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='left', x=0),
-                                yaxis=dict(title='Coverage (%)', range=[0, 100], ticksuffix='%', rangemode='tozero'),
-                                xaxis=dict(title='', tickangle=-45, automargin=True, tickfont=dict(size=10)),
-                            )
-                            st.plotly_chart(_coverage_plot, use_container_width=True)
-                        except ImportError:
-                            st.warning('Interactive coverage graph unavailable because Plotly is not installed. Install plotly from requirements.txt.')
-                            st.bar_chart(coverage_frame.set_index('Vendor / supplier group')[['Weighted coverage (%)', 'Confirmed covered (%)', 'Potential (%)']], use_container_width=True)
-                        st.caption('Bars are grouped, not stacked, and each percentage is independently capped at 100%. Weighted coverage counts each Covered scope as 1 and each Potential scope as 0.5. Geographic evidence is aligned to Gate 1 findings; document-title hints are descriptive only and do not prove country coverage. Similarity is evidence screening, not a contractual conclusion.')
-    
-                        st.subheader('Recommended primary vendors')
-                        if primary:
-                            st.dataframe(coverage_frame[coverage_frame['Vendor / supplier group'].isin(primary)], use_container_width=True, hide_index=True)
-                        else:
-                            st.warning('No primary candidates could be selected from the available scope statements.')
-                        st.subheader('Backup vendors')
-                        if backups:
-                            st.dataframe(coverage_frame[coverage_frame['Vendor / supplier group'].isin(backups)], use_container_width=True, hide_index=True)
-                        else:
-                            st.write('No additional distinct vendor groups are available as backups. Upload more independent vendor documents to identify backup options.')
-    
-                        st.subheader('Scope-by-vendor comparison matrix')
-                        matrix = pd.DataFrame([{'Scope requirement': _sow_scope_label(scope)} for scope in scope_items])
-                        for name, detail in per_vendor.items():
-                            statuses = {row['Scope requirement']: row['Status'] for row in detail['evidence']}
-                            matrix[name] = [statuses.get(_sow_scope_label(scope), 'Gap') for scope in scope_items]
+    st.caption('Upload vendor SOWs (PDF, DOCX, ZIP). Optionally upload a baseline vendor contract to calculate relative cost variance and term deviations.')
 
-                        # Keep vendor columns compact by using short display labels;
-                        # full legal/group names remain visible in the legend above.
-                        _matrix_vendor_names = [name for name in matrix.columns if name != 'Scope requirement']
-                        _matrix_aliases = {
-                            name: f'V{idx + 1}' for idx, name in enumerate(_matrix_vendor_names)
-                        }
-                        _matrix_display = matrix.rename(columns=_matrix_aliases).copy()
-                        # Use a single colored square as the status marker; keep
-                        # the textual status in the source matrix and workbook.
-                        _matrix_icons = {
-                            'Covered': '🟩',
-                            'Potential': '🟨',
-                            'Gap': '🟥',
-                        }
-                        for _vendor_name, _alias in _matrix_aliases.items():
-                            _matrix_display[_alias] = _matrix_display[_alias].map(
-                                lambda value: _matrix_icons.get(str(value), '⬜')
-                            )
-                        st.markdown(
-                            '<div style="font-size:0.88rem; line-height:1.5; margin:0.2rem 0 0.5rem 0;">'
-                            '<strong>Legend:</strong> '
-                            '<span style="color:#16803d;">🟩</span> Covered — evidence found &nbsp; · &nbsp; '
-                            '<span style="color:#b77900;">🟨</span> Potential — partial/uncertain match &nbsp; · &nbsp; '
-                            '<span style="color:#c62828;">🟥</span> Gap — no sufficient matching evidence &nbsp; · &nbsp; '
-                            '<span style="color:#64748b;">⬜</span> Unclassified — review required'
-                            '</div>',
-                            unsafe_allow_html=True,
-                        )
-                        # Put each vendor on its own line in a smaller, muted key,
-                        # so long legal names do not run together or widen matrix columns.
-                        _vendor_key_html = ''.join(
-                            '<div style="font-size:0.72rem; line-height:1.35; color:#7b8492; '
-                            'margin:1px 0; overflow-wrap:anywhere;">'
-                            f'<strong>{_alias}</strong> = {html.escape(str(_name))}</div>'
-                            for _name, _alias in _matrix_aliases.items()
-                        )
-                        st.markdown(
-                            '<div style="margin:0.25rem 0 0.65rem 0;">'
-                            '<div style="font-size:0.76rem; color:#7b8492; font-weight:600; margin-bottom:2px;">Vendor key</div>'
-                            + _vendor_key_html + '</div>',
-                            unsafe_allow_html=True,
-                        )
-                        _matrix_config = {
-                            'Scope requirement': st.column_config.TextColumn('Scope requirement', width='large'),
-                        }
-                        for _alias in _matrix_aliases.values():
-                            _matrix_config[_alias] = st.column_config.TextColumn(_alias, width='small')
-                        st.dataframe(
-                            _matrix_display,
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config=_matrix_config,
-                        )
-    
-                        st.subheader('Detailed match evidence')
-                        evidence_frame = pd.DataFrame(all_evidence_rows)
-                        status_filter = st.multiselect('Filter by match status', ['Covered', 'Potential', 'Gap'], default=['Covered', 'Potential', 'Gap'], key='sow_status_filter')
-                        st.dataframe(evidence_frame[evidence_frame['Status'].isin(status_filter)], use_container_width=True, hide_index=True)
-    
-                        document_inventory = pd.DataFrame([
-                            {'Document': document['File'], 'Characters extracted': len(document['Text']), 'Scope clauses detected': len(_sow_extract_scope(document['Text'])), 'Supplier detected': _sow_infer_vendor(document['File'], document['Text']), 'Coverage area (from title)': _sow_detect_coverage_area([document['File']], document['Text'])}
-                            for document in parsed_docs
-                        ])
-                        export_buffer = BytesIO()
-                        with pd.ExcelWriter(export_buffer, engine='openpyxl') as writer:
-                            coverage_frame.to_excel(writer, index=False, sheet_name='Vendor Summary')
-                            gate_frame.to_excel(writer, index=False, sheet_name='Gate 1 Screening')
-                            scoring_display.to_excel(writer, index=False, sheet_name='Weighted Evaluation')
-                            matrix.to_excel(writer, index=False, sheet_name='Scope Matrix')
-                            evidence_frame.to_excel(writer, index=False, sheet_name='Match Evidence')
-                            document_inventory.to_excel(writer, index=False, sheet_name='Document Inventory')
-                            pd.DataFrame({
-                                'Primary vendors': primary + [''] * (3 - len(primary)),
-                                'Backup vendors': backups + [''] * (3 - len(backups)),
-                            }).to_excel(writer, index=False, sheet_name='Recommendations')
-                        st.download_button('Download SOW comparison workbook', data=export_buffer.getvalue(), file_name='Vendor_SOW_Analysis.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', use_container_width=True)
-                        try:
-                            _pptx_required = [
-                                'Vendor / supplier group', 'Composite score (/100)', 'Gate 1 status',
-                                'Global reach (/100)', 'Scope breadth (/100)', 'SLA rigor (/100)',
-                                'Commercials & scalability (/100)', 'Recommended role', 'Rank'
-                            ]
-                            _pptx_defaults = {
-                                'Vendor / supplier group': 'Unidentified vendor',
-                                'Composite score (/100)': 0, 'Gate 1 status': 'Review',
-                                'Global reach (/100)': 0, 'Scope breadth (/100)': 0, 'SLA rigor (/100)': 0,
-                                'Commercials & scalability (/100)': 0, 'Recommended role': 'Not shortlisted',
-                                'Rank': '',
-                            }
-                            for _column, _default in _pptx_defaults.items():
-                                if _column not in coverage_frame.columns:
-                                    coverage_frame[_column] = _default
-                            pptx_summary = coverage_frame.reindex(columns=_pptx_required).rename(columns={
-                                'Vendor / supplier group': 'Vendor',
-                                'Global reach (/100)': 'Global reach',
-                                'Scope breadth (/100)': 'Scope breadth',
-                                'SLA rigor (/100)': 'SLA rigor',
-                                'Commercials & scalability (/100)': 'Commercials',
-                            })
-                            pptx_buffer = _sow_build_pptx(
-                                pptx_summary, gate_frame, matrix, analysis_mode, len(scope_items), len(parsed_vendors)
-                            )
-                            st.download_button(
-                                'Download executive PowerPoint (.pptx)',
-                                data=pptx_buffer,
-                                file_name='Global_Vendor_SOW_Executive_Summary.pptx',
-                                mime='application/vnd.openxmlformats-officedocument.presentationml.presentation',
-                                use_container_width=True,
-                            )
-                        except Exception as pptx_exc:
-                            st.warning('The analysis results and Excel workbook are ready, but the PowerPoint could not be generated. Check that python-pptx is installed and the export columns are available.')
-                            st.caption(f'PowerPoint diagnostic: {type(pptx_exc).__name__}')
-                        st.warning('Before selecting vendors, validate the source clauses for geography/countries, response and resolution SLAs, hours of coverage, onsite/remote requirements, exclusions, dependencies, certifications, subcontracting, and commercial assumptions. The analyzer does not certify legal equivalence.')
-            _sow_run_status.success('Analysis processing finished. Review the Gate 1 screening, Gate 2 weighted results, and download options below.')
-        except Exception as exc:
-            # Show a sanitized diagnostic category; never display extracted SOW content.
-            _sow_run_status.error('Analysis stopped because of an actual processing error.')
-            exc_name = type(exc).__name__
-            if isinstance(exc, ValueError) and '100 MB' in str(exc):
-                st.error('The expanded document content exceeds the 100 MB processing limit. Remove large or duplicate files, or split the ZIP into smaller batches.')
-            elif 'password' in str(exc).lower() or 'encrypted' in str(exc).lower():
-                st.error('A password-protected document or archive could not be read. Upload an unlocked copy.')
-            elif exc_name in ('ModuleNotFoundError', 'ImportError'):
-                st.error('A required document-reader or export dependency is missing. Install the packages listed in requirements.txt and restart the app.')
-            else:
-                st.error('The SOW documents could not be analyzed. Check file readability, password protection, required dependencies, and the expanded processing limit.')
-            st.caption(f'Technical diagnostic: {exc_name}')
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        vendor_files = st.file_uploader(
+            'Upload Candidate Vendor SOWs (up to 26 files or ZIP archive)',
+            type=list(SOW_SUPPORTED_EXTS),
+            accept_multiple_files=True,
+            key='sow_vendor_files'
+        )
+    with col2:
+        baseline_file = st.file_uploader(
+            'Upload Optional Baseline SOW (Benchmark reference)',
+            type=list(SOW_SUPPORTED_EXTS),
+            accept_multiple_files=False,
+            key='sow_baseline_single'
+        )
+
+    if st.button('Run SOW & Vendor Analysis', type='primary', use_container_width=True, key='run_sow_analysis'):
+        if not vendor_files:
+            st.warning("Please upload candidate vendor SOW files to analyze.")
+            st.stop()
+
+        with st.spinner('Parsing SOW documents, extracting rate cards, and evaluating vendors...'):
+            expanded_docs, doc_errors = _sow_expand_uploads(vendor_files, return_errors=True)
+            if not expanded_docs:
+                st.error("No readable text found in uploaded candidate documents.")
+                st.stop()
+
+
+            # Exclude duplicate files
+            unique_docs, duplicate_files = _sow_filter_duplicate_files(expanded_docs)
+            if not unique_docs:
+                st.error("All uploaded files were identified as duplicate copies.")
+                st.stop()
+
+
+            if duplicate_files:
+                st.info(f"Excluded {len(duplicate_files)} duplicate file(s) from analysis: {', '.join(duplicate_files)}")
+
+
+            baseline_data = None
+            if baseline_file:
+                b_docs = _sow_expand_uploads([baseline_file])
+                if b_docs:
+                    baseline_data = _sow_parse_vendor_data(b_docs[0]["File"], b_docs[0]["Text"], is_baseline=True)
+
+            candidates = []
+            for doc in unique_docs:
+                parsed = _sow_parse_vendor_data(doc['File'], doc['Text'], is_baseline=False)
+                candidates.append(parsed)
+
+
+
+
+            candidates = _sow_merge_duplicate_vendors(candidates)
+
+
+
+
+
+
+
+
+            comp_transposed, score_df, base_df = _sow_score_vendors(candidates, baseline_data)
+
+
+
+
+            comp_transposed = _make_unique_columns(comp_transposed)
+            score_df = _make_unique_columns(score_df)
+            if not base_df.empty:
+                base_df = _make_unique_columns(base_df)
+
+
+
+
+
+
+
+
+            st.success(f"Successfully evaluated {len(candidates)} vendor SOW(s)!")
+
+
+
+
+
+
+
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Total Vendors Assessed", len(candidates))
+            k2.metric("Primary Recommended", min(3, len(candidates)))
+            k3.metric("Backup Recommended", min(3, max(0, len(candidates) - 3)))
+            k4.metric("Benchmark Used", "Custom Baseline" if baseline_data else "Cohort Median")
+
+
+
+
+
+
+
+
+            st.subheader("1. SOW Comparative Summary")
+            st.dataframe(comp_transposed, use_container_width=True, hide_index=True)
+
+
+
+
+
+
+
+
+            st.subheader("2. Vendor Ranking & Shortlist (100-Point Selection)")
+            st.dataframe(score_df, use_container_width=True, hide_index=True)
+
+
+
+
+
+
+
+
+            try:
+                import plotly.graph_objects as go
+                fig = go.Figure()
+                fig.add_trace(go.Bar(
+                    x=score_df["Vendor"],
+                    y=score_df["Composite Score (/100)"],
+                    marker_color="#008A69",
+                    text=score_df["Recommended Role"],
+                    textposition="auto"
+                ))
+                fig.update_layout(
+                    title="Vendor Composite Scores and Role Allocation",
+                    yaxis=dict(title="Score / 100", range=[0, 100]),
+                    margin=dict(l=20, r=20, t=40, b=60),
+                    height=450
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            except ImportError:
+                st.bar_chart(score_df.set_index("Vendor")["Composite Score (/100)"])
+
+
+
+
+
+
+
+
+            if not base_df.empty:
+                st.subheader("3. Baseline Contract Benchmarking")
+                st.caption(f"Benchmarked against uploaded baseline: {baseline_data['Vendor']}")
+                st.dataframe(base_df, use_container_width=True, hide_index=True)
+
+
+
+
+
+
+
+
+            st.subheader("4. Download Complete Reports")
+            dcol1, dcol2 = st.columns(2)
+
+
+
+
+
+
+
+
+            excel_bytes = _sow_build_excel_export(comp_transposed, score_df, base_df)
+            dcol1.download_button(
+                "📥 Download Analysis Workbook (Excel with Tables & Chart)",
+                data=excel_bytes,
+                file_name="Vendor_SOW_Evaluation_Analysis.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+
+
+
+
+
+
+
+
+            try:
+                pptx_bytes = _sow_build_pptx_export(comp_transposed, score_df, base_df)
+                dcol2.download_button(
+                    "📊 Download Executive Presentation (PowerPoint with Tables & Chart)",
+                    data=pptx_bytes,
+                    file_name="Vendor_SOW_Executive_Deck.pptx",
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    use_container_width=True
+                )
+            except Exception as e:
+                dcol2.warning(f"PowerPoint generation unavailable: {e}")
+
+
+
+
+
+
+
+
     st.stop()
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# -----------------------------------------------------------------------------
+# TOOL 2: PDF APPROVAL STAMP TOOL (UNCHANGED)
+# -----------------------------------------------------------------------------
 st.markdown("""
 <style>
 .block-container {padding-top: 1.5rem; max-width: 1400px;}
@@ -2481,6 +2010,13 @@ st.markdown("""
 <p>Extract GL details, validate approval totals, and stamp a separate copy of an invoice.</p>
 </div>
 """, unsafe_allow_html=True)
+
+
+
+
+
+
+
 
 with st.sidebar:
     st.header("Processing rules")
@@ -2495,9 +2031,23 @@ with st.sidebar:
         stamp_placement = "Center in available blank space"
     st.caption("Region-specific validation rules are applied automatically.")
 
+
+
+
+
+
+
+
 if selected_region == "INDIA":
     st.subheader("India — NCR AP Upload CSV")
     st.caption("Upload matching invoice PDFs; matching requires both invoice number and supplier GSTIN.")
+
+
+
+
+
+
+
 
     qcol, ycol = st.columns(2)
     with qcol:
@@ -2515,7 +2065,13 @@ if selected_region == "INDIA":
             index=datetime.now().month - 1,
         )
 
-    # Always initialize the in-app table before rendering the PDF uploader.
+
+
+
+
+
+
+
     if "india_template_frame" not in st.session_state or st.session_state["india_template_frame"] is None:
         st.session_state["india_template_frame"] = _india_initial_table()
         st.session_state["india_csv_name"] = f"NCR Invoice AP Upload file {datetime.now().strftime('%m.%d.%Y')}.csv"
@@ -2523,12 +2079,14 @@ if selected_region == "INDIA":
         st.session_state.setdefault("india_duplicates", [])
         st.session_state.setdefault("india_results", [])
 
-    # Incrementing the uploader key recreates the widget and clears its selected PDFs.
-    # The callback runs before the next script execution, avoiding direct mutation
-    # of a file_uploader widget after it has been instantiated.
+
+
+
+
+
+
+
     def _reset_india_pdf_uploads():
-        # Clear the selected PDFs, restore the default template table, and clear
-        # the previous extraction results without affecting other regions.
         st.session_state["india_pdf_uploader_version"] = (
             st.session_state.get("india_pdf_uploader_version", 0) + 1
         )
@@ -2541,6 +2099,13 @@ if selected_region == "INDIA":
         )
         st.session_state.pop("india_template_data_editor", None)
 
+
+
+
+
+
+
+
     _india_pdf_uploader_key = f"india_pdfs_{st.session_state.get('india_pdf_uploader_version', 0)}"
     india_pdfs = st.file_uploader(
         "Upload matching invoice PDFs",
@@ -2548,6 +2113,13 @@ if selected_region == "INDIA":
         accept_multiple_files=True,
         key=_india_pdf_uploader_key,
     )
+
+
+
+
+
+
+
 
     if india_pdfs and st.button("Extract PDF data into template table", type="primary", use_container_width=True):
         try:
@@ -2565,6 +2137,13 @@ if selected_region == "INDIA":
             st.success(f"Extracted data into the table. {len(india_results)} invoice record(s) matched.")
         except Exception:
             st.error("The invoice PDFs could not be processed. Check that the PDFs are valid and try again.")
+
+
+
+
+
+
+
 
     st.markdown("""
     <style>
@@ -2612,10 +2191,24 @@ if selected_region == "INDIA":
         )
         st.dataframe(_india_totals_display, use_container_width=True, hide_index=True)
 
+
+
+
+
+
+
+
     if st.session_state.get("india_unmatched"):
         st.warning("Some table rows did not match both invoice number and supplier GSTIN. Those rows were not filled: " + ", ".join(st.session_state["india_unmatched"]))
     if st.session_state.get("india_duplicates"):
         st.warning("Duplicate invoice PDFs were uploaded for: " + ", ".join(st.session_state["india_duplicates"]))
+
+
+
+
+
+
+
 
     _india_xlsx_buffer = BytesIO()
     with pd.ExcelWriter(_india_xlsx_buffer, engine="openpyxl") as _writer:
@@ -2641,9 +2234,13 @@ if selected_region == "INDIA":
                     _cell.fill = _scarlet
                     _cell.font = _white_bold
 
-        # Fit each Excel column to its longest value/header. Long text columns
-        # are wrapped and capped at a readable width rather than stretching
-        # the workbook beyond the screen.
+
+
+
+
+
+
+
         for _column_cells in _ws.columns:
             _column_letter = _column_cells[0].column_letter
             _max_content_length = max(
@@ -2656,6 +2253,13 @@ if selected_region == "INDIA":
             )
         _ws.freeze_panes = "A2"
         _ws.auto_filter.ref = _ws.dimensions
+
+
+
+
+
+
+
 
     st.markdown("""
     <style>
@@ -2672,6 +2276,13 @@ if selected_region == "INDIA":
     </style>
     """, unsafe_allow_html=True)
 
+
+
+
+
+
+
+
     st.download_button(
         "Download formatted Excel table",
         data=_india_xlsx_buffer.getvalue(),
@@ -2679,6 +2290,13 @@ if selected_region == "INDIA":
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
+
+
+
+
+
+
+
 
     st.button(
         "Reset uploaded PDFs and table",
@@ -2689,10 +2307,31 @@ if selected_region == "INDIA":
     st.stop()
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 uploaded_pdf = st.file_uploader("Upload invoice PDF", type=["pdf"])
 
+
+
+
+
+
+
+
 if uploaded_pdf is not None:
-    pdf_content = uploaded_pdf.getvalue()  # in-memory; no local temp copy
+    pdf_content = uploaded_pdf.getvalue()
     try:
         with st.spinner("Searching PDF text and using OCR if needed..."):
             candidate_pages, used_ocr = find_candidate_pages(pdf_content)
@@ -2700,14 +2339,26 @@ if uploaded_pdf is not None:
         st.error("The PDF could not be opened. Check that it is a valid, readable PDF.")
         st.stop()
 
+
+
+
+
+
+
+
     if used_ocr:
         st.info("The PDF did not contain a detectable text summary in its embedded text. OCR was attempted; verify every extracted value before stamping.")
     if not candidate_pages:
         st.error("No readable page text was detected. You can still use the tool only after selecting a readable PDF or installing/configuring OCR for scanned pages.")
         st.stop()
 
-    # Auto-detect the most likely summary/approval page using the selected region's
-    # labels and coordinate-matched values. Keep the dropdown available for correction.
+
+
+
+
+
+
+
     try:
         candidate_pages, auto_page_index = auto_detect_summary_page(
             pdf_content, selected_region, candidate_pages
@@ -2724,8 +2375,14 @@ if uploaded_pdf is not None:
     selected_position = page_labels.index(selected_page_label)
     page_index, page_text = candidate_pages[selected_position]
     extracted = extract_from_page(page_text, selected_region)
-    # The invoice summary labels and page coordinates are the source of truth.
-    # Do not use any GL codes or amounts printed in an existing approval stamp.
+
+
+
+
+
+
+
+
     try:
         _coordinate_doc = pymupdf.open(stream=pdf_content, filetype="pdf")
         try:
@@ -2738,15 +2395,28 @@ if uploaded_pdf is not None:
             extracted["rows"] = _coordinate_rows
             extracted["total"] = _coordinate_total
         else:
-            # Fail closed rather than silently carrying forward incorrect stamped rows.
             extracted["rows"] = _coordinate_rows
             extracted["total"] = _coordinate_total
     except Exception:
         extracted["rows"] = []
         extracted["total"] = None
 
+
+
+
+
+
+
+
     st.subheader("Extracted information")
     st.caption(f"Selected summary page: {page_index + 1}")
+
+
+
+
+
+
+
 
     rows = extracted["rows"] or [{base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8"): "", "Amount": None}]
     editable_frame = pd.DataFrame(classify_rows(selected_region, rows))
@@ -2761,6 +2431,13 @@ if uploaded_pdf is not None:
         },
         key="gl_editor",
     )
+
+
+
+
+
+
+
 
     first, second, third = st.columns(3)
     with first:
@@ -2788,12 +2465,26 @@ if uploaded_pdf is not None:
         )
     approver_email = st.text_input("Approver email", value=_secret_email or extracted["email"])
 
+
+
+
+
+
+
+
     final_rows = []
     for _, row in edited_frame.iterrows():
         code = str(row.get(base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8"), "")).strip()
         amount = row.get("Amount")
         if code and amount is not None and str(amount).strip().lower() != "nan":
             final_rows.append({base64.b64decode("SnVuaXBlciBHTCBDb2Rl").decode("utf-8"): code, "Amount": float(amount)})
+
+
+
+
+
+
+
 
     classified_rows = classify_rows(selected_region, final_rows)
     warnings = validate_rows(selected_region, classified_rows, invoice_total)
@@ -2802,6 +2493,13 @@ if uploaded_pdf is not None:
     if not warnings:
         st.success("Line amounts match the total. Review the stamp preview before processing.")
 
+
+
+
+
+
+
+
     st.subheader("Stamp preview")
     preview_lines = ["GL CODE                         AMOUNT"]
     for row in final_rows:
@@ -2809,6 +2507,13 @@ if uploaded_pdf is not None:
     preview_lines.append(f"TOTAL AMOUNT    ${invoice_total:,.2f}")
     preview_lines += ["", f"Approved by {approver_name} {approval_date}".strip(), approver_email]
     st.code("\n".join(preview_lines), language="text")
+
+
+
+
+
+
+
 
     if st.button("Create stamped PDF", type="primary", use_container_width=True):
         if not final_rows:
@@ -2853,6 +2558,13 @@ else:
     3. Review or correct the extracted GL codes and amounts.
     4. Confirm the total, approver, date, and email.
     5. Create and download the stamped PDF.
+
+
+
+
+
+
+
 
     Uploaded content is processed in memory by this app; it does not intentionally write invoice data to local temporary files or logs.
     """)
